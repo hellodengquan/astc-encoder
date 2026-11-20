@@ -539,6 +539,7 @@ static std::string get_slice_filename(
  * @param      y_flip            Should this image be Y flipped?
  * @param[out] is_hdr            Is the loaded image HDR?
  * @param[out] component_count   The number of components in the loaded image.
+ * @param[out] color_space       The color space declared by the loaded image.
  *
  * @return The loaded image, or @c nullptr on error.
  */
@@ -547,19 +548,24 @@ static astcenc_image_ptr load_uncomp_file(
 	size_t dim_z,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count
+	unsigned int& component_count,
+	astcenc_color_space& color_space
 ) {
 	astcenc_image_ptr image;
+
+	// Default to no declaration for array loads, where slices may disagree
+	color_space = astcenc_color_space::unknown;
 
 	// Load 2D images directly
 	if (dim_z == 1)
 	{
-		return load_ncimage(filename, y_flip, is_hdr, component_count);
+		return load_ncimage(filename, y_flip, is_hdr, component_count, color_space);
 	}
 	else
 	{
 		bool slice_is_hdr;
 		unsigned int slice_component_count;
+		astcenc_color_space slice_color_space;
 		std::vector<astcenc_image_ptr> slices;
 
 		// For a 3D image load an array of slices
@@ -574,7 +580,7 @@ static astcenc_image_ptr load_uncomp_file(
 			}
 
 			auto slice = load_ncimage(slice_name.c_str(), y_flip,
-			                          slice_is_hdr, slice_component_count);
+			                          slice_is_hdr, slice_component_count, slice_color_space);
 			if (!slice)
 			{
 				break;
@@ -608,6 +614,7 @@ static astcenc_image_ptr load_uncomp_file(
 			{
 				is_hdr = slice_is_hdr;
 				component_count = slice_component_count;
+				color_space = slice_color_space;
 			}
 
 			slices.push_back(std::move(slice));
@@ -1963,7 +1970,9 @@ static bool store_ldr_exposures(
 		}
 
 		std::string output = base + suffix + ending;
-		bool is_store_error = store_ncimage(exposure.get(), output.c_str(), cli_config.y_flip);
+		// Exposures are tone mapped from linear HDR data, so they remain linear
+		bool is_store_error = store_ncimage(exposure.get(), output.c_str(), cli_config.y_flip,
+		                                    astcenc_color_space::linear);
 		if (is_store_error)
 		{
 			print_error("ERROR: Failed to write exposure image %s\n", output.c_str());
@@ -2262,7 +2271,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, partition_func);
 	std::string fname = stem + "_diag_partitioning.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Weight planes  ---- ---- ---- ----
 	auto texel_func1 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2288,7 +2298,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func1);
 	fname = stem + "_diag_weight_plane2.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Weight density  ---- ---- ---- ----
 	auto texel_func2 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2309,7 +2320,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func2);
 	fname = stem + "_diag_weight_density.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Weight quant  ---- ---- ---- ----
 	auto texel_func3 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2327,7 +2339,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func3);
 	fname = stem + "_diag_weight_quant.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Color quant  ---- ---- ---- ----
 	auto texel_func4 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2345,7 +2358,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func4);
 	fname = stem + "_diag_color_quant.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Color endpoint mode: Index ---- ---- ---- ----
 	auto texel_func5 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2366,7 +2380,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func5);
 	fname = stem + "_diag_cem_index.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Color endpoint mode: Components ---- ---- ---- ----
 	auto texel_func6 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2419,7 +2434,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func6);
 	fname = stem + "_diag_cem_components.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Color endpoint mode: Style ---- ---- ---- ----
 	auto texel_func7 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2480,7 +2496,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func7);
 	fname = stem + "_diag_cem_style.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 
 	// ---- ---- ---- ---- Color endpoint mode: Style ---- ---- ---- ----
 	auto texel_func8 = [](astcenc_block_info& info, size_t texel_x, size_t texel_y) {
@@ -2522,7 +2539,8 @@ static void print_diagnostic_images(
 
 	print_diagnostic_image(context, image, *diag_image, texel_func8);
 	fname = stem + "_diag_cem_hdr.png";
-	store_ncimage(diag_image.get(), fname.c_str(), false);
+	store_ncimage(diag_image.get(), fname.c_str(), false,
+	              astcenc_color_space::linear);
 }
 #endif
 
@@ -2676,6 +2694,7 @@ int astcenc_main(
 	std::vector<void*> crop_slices;
 	unsigned int image_uncomp_in_component_count = 0;
 	bool image_uncomp_in_is_hdr = false;
+	astcenc_color_space image_uncomp_in_color_space = astcenc_color_space::unknown;
 	astcenc_image_ptr image_decomp_out;
 
 	astcenc_error codec_status;
@@ -2718,12 +2737,40 @@ int astcenc_main(
 		bool is_y_flip_needed = cli_config.y_flip && !cli_config.is_crop_requested;
 		image_uncomp_in_storage = load_uncomp_file(
 		    input_filename.c_str(), cli_config.array_size, is_y_flip_needed,
-		    image_uncomp_in_is_hdr, image_uncomp_in_component_count);
+		    image_uncomp_in_is_hdr, image_uncomp_in_component_count,
+		    image_uncomp_in_color_space);
 		image_uncomp_in = image_uncomp_in_storage.get();
 		if (!image_uncomp_in)
 		{
 			print_error("ERROR: Failed to load uncompressed image file\n");
 			return 1;
+		}
+
+		// Warn if the color space declared by the input file conflicts with the selected profile.
+		// The texel values are used unchanged, so this only reports the difference to the caller.
+		if (operation & ASTCENC_STAGE_COMPRESS)
+		{
+			const char* profile_name = "linear";
+			if (config.profile == ASTCENC_PRF_LDR_SRGB)
+			{
+				profile_name = "sRGB";
+			}
+			else if ((config.profile == ASTCENC_PRF_HDR) ||
+			         (config.profile == ASTCENC_PRF_HDR_RGB_LDR_A))
+			{
+				profile_name = "HDR";
+			}
+
+			if ((image_uncomp_in_color_space == astcenc_color_space::srgb) &&
+			    (config.profile != ASTCENC_PRF_LDR_SRGB))
+			{
+				printf("WARNING: Input file is sRGB, but compressing as %s\n", profile_name);
+			}
+			else if ((image_uncomp_in_color_space == astcenc_color_space::linear) &&
+			         (config.profile == ASTCENC_PRF_LDR_SRGB))
+			{
+				printf("WARNING: Input file is linear, but compressing as %s\n", profile_name);
+			}
 		}
 
 		if (cli_config.is_crop_requested)
@@ -2859,6 +2906,15 @@ int astcenc_main(
 		{
 			config.flags |= ASTCENC_FLG_USE_DECODE_UNORM8;
 		}
+	}
+
+	// Color space to declare in container output formats. Only 8-bit sRGB data can be stored with
+	// a format a graphics API samples using hardware sRGB decode; linear and floating-point data
+	// retain their existing format declarations.
+	astcenc_color_space output_color_space = astcenc_color_space::linear;
+	if ((config.profile == ASTCENC_PRF_LDR_SRGB) && (out_bitness == 8))
+	{
+		output_color_space = astcenc_color_space::srgb;
 	}
 
 	astcenc_context* codec_context_raw { nullptr };
@@ -3083,7 +3139,7 @@ int astcenc_main(
 			else
 			{
 				is_store_error = store_ncimage(image_decomp_out.get(), output_filename.c_str(),
-				                              cli_config.y_flip);
+				                              cli_config.y_flip, output_color_space);
 			}
 
 			if (is_store_error)

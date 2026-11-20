@@ -1047,6 +1047,131 @@ class CLIPTest(CLITestBase):
                     color_out = tli.Image(image_out_dec).get_colors((7, 7))
                     self.assertColorSame(color_in, color_out)
 
+    @staticmethod
+    def get_ktx_gl_internal_format(path: Path) -> int:
+        '''
+        Read the GL internal format field from a KTX1 header.
+
+        Args:
+            path: The KTX file to inspect.
+
+        Return:
+            The GL internal format enum value.
+        '''
+        data = path.read_bytes()
+        fields = struct.unpack('<13I', data[12:64])
+
+        # endian, glType, glTypeSize, glFormat, glInternalFormat, ...
+        return fields[4]
+
+    @staticmethod
+    def get_dds_dxgi_format(path: Path) -> int:
+        '''
+        Read the DXGI format field from the DX10 header of a DDS file.
+
+        Args:
+            path: The DDS file to inspect.
+
+        Return:
+            The DXGI format value, or zero if no DX10 header was stored.
+        '''
+        data = path.read_bytes()
+        fields = struct.unpack('<31I', data[4:128])
+
+        # ddspf flags are at index 19, fourcc is at index 20 in the header word list
+        ddspf_flags = fields[19]
+        fourcc = struct.pack('<I', fields[20])
+
+        if not (ddspf_flags & 4) or fourcc != b'DX10':
+            return 0
+
+        return struct.unpack('<I', data[128:132])[0]
+
+    def test_srgb_container_color_space(self) -> None:
+        '''
+        Test 8-bit sRGB output declares an sRGB format in KTX and DDS containers.
+        '''
+        image_in = self.get_image_path('Tiles/ldr-rgba.png')
+
+        for extension, reader, expected in (
+                ('.ktx', self.get_ktx_gl_internal_format, 0x8C43),  # GL_SRGB8_ALPHA8
+                ('.dds', self.get_dds_dxgi_format, 29)):            # DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            with self.subTest(extension=extension):
+                image_out = self.get_tmp_image_path('EXP', extension)
+
+                # Test mode compresses and decompresses to an uncompressed output container
+                cmd = [self.binary, '-ts', image_in, image_out, '4x4', '-fast']
+                self.exec(cmd)
+
+                self.assertTrue(image_out.is_file())
+                self.assertEqual(reader(image_out), expected)
+
+    def test_linear_container_color_space(self) -> None:
+        '''
+        Test 8-bit linear output retains a linear format in KTX and DDS containers.
+        '''
+        image_in = self.get_image_path('Tiles/ldr-rgba.png')
+
+        for extension, reader, expected in (
+                ('.ktx', self.get_ktx_gl_internal_format, 0x8058),  # GL_RGBA8
+                ('.dds', self.get_dds_dxgi_format, 0)):             # Legacy linear pixel format
+            with self.subTest(extension=extension):
+                image_out = self.get_tmp_image_path('EXP', extension)
+
+                cmd = [self.binary, '-tl', image_in, image_out, '4x4', '-fast']
+                self.exec(cmd)
+
+                self.assertTrue(image_out.is_file())
+                self.assertEqual(reader(image_out), expected)
+
+    def test_hdr_container_color_space(self) -> None:
+        '''
+        Test HDR output retains a floating-point format in KTX and DDS containers.
+        '''
+        image_in = self.get_ref_image_path('HDR', 'input', 'A')
+
+        # The reference image has three components, so KTX uses GL_RGB16F
+        for extension, reader, expected in (
+                ('.ktx', self.get_ktx_gl_internal_format, 0x881B),  # GL_RGB16F
+                ('.dds', self.get_dds_dxgi_format, 10)):            # DXGI_FORMAT_R16G16B16A16_FLOAT
+            with self.subTest(extension=extension):
+                image_out = self.get_tmp_image_path('EXP', extension)
+
+                cmd = [self.binary, '-tH', image_in, image_out, '4x4', '-fast']
+                self.exec(cmd)
+
+                self.assertTrue(image_out.is_file())
+                self.assertEqual(reader(image_out), expected)
+
+    def test_container_input_color_space_warning(self) -> None:
+        '''
+        Test input color space declarations are reported but do not alter texel values.
+        '''
+        image_in = self.get_image_path('Tiles/ldr-rgba.png')
+
+        # Build both an sRGB and a linear KTX with an identical binary payload
+        srgb_ktx = self.get_tmp_image_path('EXP', '.ktx')
+        linear_ktx = self.get_tmp_image_path('EXP', '.ktx')
+
+        cmd = [self.binary, '-ts', image_in, srgb_ktx, '4x4', '-fast']
+        self.exec(cmd)
+
+        raw = bytearray(srgb_ktx.read_bytes())
+        struct.pack_into('<I', raw, 28, 0x8058)  # GL_RGBA8
+        linear_ktx.write_bytes(bytes(raw))
+
+        # The sRGB declaration conflicts with the linear profile used to compress
+        cmd = [self.binary, '-cl', srgb_ktx, self.get_tmp_image_path('EXP', '.astc'),
+               '4x4', '-fast']
+        stdout = self.exec(cmd)
+        self.assertIn('WARNING: Input file is sRGB, but compressing as linear', stdout)
+
+        # The same payload declared linear must not warn
+        cmd = [self.binary, '-cl', linear_ktx, self.get_tmp_image_path('EXP', '.astc'),
+               '4x4', '-fast']
+        stdout = self.exec(cmd)
+        self.assertNotIn('WARNING: Input file is', stdout)
+
     def test_compress_normal_psnr(self) -> None:
         '''
         Test compression of normal textures using PSNR error metrics.

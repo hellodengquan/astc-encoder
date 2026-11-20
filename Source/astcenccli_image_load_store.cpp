@@ -125,6 +125,7 @@ struct stbi_image_deleter
  * @param      y_flip            Should the image be vertically flipped?
  * @param[out] is_hdr            Is this an HDR image load? Always @c true for this function.
  * @param[out] component_count   The number of components in the data.
+ * @param[out] color_space       The color space declared by the file.
  *
  * @return The loaded image data in a canonical 4 channel format.
  */
@@ -132,7 +133,8 @@ static astcenc_image_ptr load_image_with_tinyexr(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count
+	unsigned int& component_count,
+	astcenc_color_space& color_space
 ) {
 	int dim_x, dim_y;
 	float* image_raw;
@@ -152,6 +154,7 @@ static astcenc_image_ptr load_image_with_tinyexr(
 
 	is_hdr = true;
 	component_count = 4;
+	color_space = astcenc_color_space::unknown;
 	return res_img;
 }
 
@@ -162,6 +165,7 @@ static astcenc_image_ptr load_image_with_tinyexr(
  * @param      y_flip            Should the image be vertically flipped?
  * @param[out] is_hdr            Is this an HDR image load?
  * @param[out] component_count   The number of components in the data.
+ * @param[out] color_space       The color space declared by the file.
  *
  * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
  */
@@ -169,7 +173,8 @@ static astcenc_image_ptr load_image_with_stb(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count
+	unsigned int& component_count,
+	astcenc_color_space& color_space
 ) {
 	int dim_x, dim_y;
 
@@ -183,6 +188,7 @@ static astcenc_image_ptr load_image_with_stb(
 			auto img = astc_img_from_floatx4_array(data.get(), dim_x, dim_y, y_flip);
 			is_hdr = true;
 			component_count = 4;
+			color_space = astcenc_color_space::unknown;
 			return img;
 		}
 	}
@@ -196,6 +202,7 @@ static astcenc_image_ptr load_image_with_stb(
 			auto img = astc_img_from_unorm8x4_array(data.get(), dim_x, dim_y, y_flip);
 			is_hdr = false;
 			component_count = 4;
+			color_space = astcenc_color_space::unknown;
 			return img;
 		}
 	}
@@ -207,17 +214,21 @@ static astcenc_image_ptr load_image_with_stb(
 /**
  * @brief Save an EXR image using TinyExr to provide the store routine.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare in container formats; unused here.
  *
  * @return @c true on error, @c false on success.
  */
 static bool store_exr_image_with_tinyexr(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
+	ASTCENC_UNUSED(color_space);
+
 	if ((img->dim_x > max_s32) || (img->dim_y > max_s32))
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
@@ -246,17 +257,21 @@ static bool store_exr_image_with_tinyexr(
 /**
  * @brief Save a PNG image using STBImageWrite to provide the store routine.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare in container formats; unused here.
  *
  * @return @c true on error, @c false on success.
  */
 static bool store_png_image_with_stb(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
+	ASTCENC_UNUSED(color_space);
+
 	if ((img->dim_x > max_s32 / 4) || (img->dim_y > max_s32))
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
@@ -288,17 +303,21 @@ static bool store_png_image_with_stb(
 /**
  * @brief Save a TGA image using STBImageWrite to provide the store routine.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare in container formats; unused here.
  *
  * @return @c true on error, @c false on success.
  */
 static bool store_tga_image_with_stb(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
+	ASTCENC_UNUSED(color_space);
+
 	if ((img->dim_x > max_u16) || (img->dim_y > max_u16))
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
@@ -330,17 +349,21 @@ static bool store_tga_image_with_stb(
 /**
  * @brief Save a BMP image using STBImageWrite to provide the store routine.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare in container formats; unused here.
  *
  * @return @c true on error, @c false on success.
  */
 static bool store_bmp_image_with_stb(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
+	ASTCENC_UNUSED(color_space);
+
 	if ((img->dim_x > max_s32 / 4) || (img->dim_y > max_s32))
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
@@ -372,17 +395,21 @@ static bool store_bmp_image_with_stb(
 /**
  * @brief Save a HDR image using STBImageWrite to provide the store routine.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare in container formats; unused here.
  *
  * @return @c true on error, @c false on success.
  */
 static bool store_hdr_image_with_stb(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
+	ASTCENC_UNUSED(color_space);
+
 	if ((img->dim_x > max_s32 / 4) || (img->dim_y > max_s32))
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
@@ -766,6 +793,13 @@ static void switch_endianness4(
 #define GL_RGB16F                                   0x881B
 #define GL_RGBA16F                                  0x881A
 
+#define GL_SRGB                                     0x8C40
+#define GL_SRGB_ALPHA                               0x8C42
+#define GL_SRGB8                                    0x8C41
+#define GL_SRGB8_ALPHA8                             0x8C43
+#define GL_SLUMINANCE8_ALPHA8                       0x8C45
+#define GL_SLUMINANCE8                              0x8C47
+
 #define GL_UNSIGNED_BYTE                            0x1401
 #define GL_UNSIGNED_SHORT                           0x1403
 #define GL_HALF_FLOAT                               0x140B
@@ -960,12 +994,40 @@ static void ktx_header_switch_endianness(ktx_header * kt)
 }
 
 /**
+ * @brief Determine if a KTX internal format declares sRGB encoded data.
+ *
+ * KTX1 files may store either a sized or an unsized internal format, so both
+ * fields are checked by the caller.
+ *
+ * @param gl_internal_format   The internal format value from the KTX header.
+ *
+ * @return @c true if the format declares sRGB encoded data, @c false otherwise.
+ */
+static bool ktx_internal_format_is_srgb(
+	uint32_t gl_internal_format
+) {
+	switch (gl_internal_format)
+	{
+	case GL_SRGB:
+	case GL_SRGB_ALPHA:
+	case GL_SRGB8:
+	case GL_SRGB8_ALPHA8:
+	case GL_SLUMINANCE8:
+	case GL_SLUMINANCE8_ALPHA8:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/**
  * @brief Load an uncompressed KTX image using the local custom loader.
  *
  * @param      filename          The name of the file to load.
  * @param      y_flip            Should the image be vertically flipped?
  * @param[out] is_hdr            Is this an HDR image load?
  * @param[out] component_count   The number of components in the data.
+ * @param[out] color_space       The color space declared by the file.
  *
  * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
  */
@@ -973,7 +1035,8 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count
+	unsigned int& component_count,
+	astcenc_color_space& color_space
 ) {
 	std::ifstream file(filename, std::ios::in | std::ios::binary);
 	if (!file)
@@ -1007,6 +1070,22 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 	{
 		print_error("ERROR: Image uses unsupported KTX format '%s'\n", filename);
 		return nullptr;
+	}
+
+	// Identify the color space declared by the internal format. The unsized base internal format
+	// is only used when the sized internal format field is not populated.
+	uint32_t internal_format = hdr.gl_internal_format != 0 ?
+	                           hdr.gl_internal_format :
+	                           hdr.gl_base_internal_format;
+
+	astcenc_color_space declared_color_space = astcenc_color_space::unknown;
+	if (ktx_internal_format_is_srgb(internal_format))
+	{
+		declared_color_space = astcenc_color_space::srgb;
+	}
+	else if (internal_format != 0)
+	{
+		declared_color_space = astcenc_color_space::linear;
 	}
 
 	// Supported formats are all pairings of:
@@ -1342,6 +1421,7 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 
 	is_hdr = bitness >= 16;
 	component_count = components;
+	color_space = declared_color_space;
 	return astc_img;
 }
 
@@ -1537,16 +1617,18 @@ bool store_ktx_compressed_image(
 /**
  * @brief Save a KTX uncompressed image using a local store routine.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare for 8-bit images.
  *
  * @return @c true on error, @c false on success.
  */
 static bool store_ktx_uncompressed_image(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
 	if ((img->dim_x > max_u32) || (img->dim_y > max_u32) || (img->dim_z > max_u32))
 	{
@@ -1600,6 +1682,14 @@ static bool store_ktx_uncompressed_image(
 		GL_R8, GL_RG8, GL_RGB8, GL_RGBA8
 	};
 
+	static const int gl_sized_format_of_components_ldr_srgb[4] {
+		GL_SRGB8, GL_SRGB8, GL_SRGB8, GL_SRGB8_ALPHA8
+	};
+
+	static const int gl_base_format_of_components_ldr_srgb[4] {
+		GL_SRGB, GL_SRGB, GL_SRGB, GL_SRGB_ALPHA
+	};
+
 	static const int gl_sized_format_of_components_hdr[4] {
 		GL_R16F, GL_RG16F, GL_RGB16F, GL_RGBA16F
 	};
@@ -1610,16 +1700,27 @@ static bool store_ktx_uncompressed_image(
 	hdr.gl_type_size = bitness / 8;
 	hdr.gl_format = gl_format_of_components[image_components - 1];
 
+	bool is_ldr_srgb = (bitness == 8) && (color_space == astcenc_color_space::srgb);
+
 	if (bitness == 16)
 	{
+		// Floating-point data is always linear, regardless of the requested color space
 		hdr.gl_internal_format = gl_sized_format_of_components_hdr[image_components - 1];
+		hdr.gl_base_internal_format = hdr.gl_format;
+	}
+	else if (is_ldr_srgb)
+	{
+		// Only 8-bit textures can declare an sRGB internal format, so a graphics API can sample the
+		// stored texels directly with hardware sRGB decode
+		hdr.gl_internal_format = gl_sized_format_of_components_ldr_srgb[image_components - 1];
+		hdr.gl_base_internal_format = gl_base_format_of_components_ldr_srgb[image_components - 1];
 	}
 	else
 	{
 		hdr.gl_internal_format = gl_sized_format_of_components_ldr[image_components - 1];
+		hdr.gl_base_internal_format = hdr.gl_format;
 	}
 
-	hdr.gl_base_internal_format = hdr.gl_format;
 	hdr.pixel_width = dim_x_field;
 	hdr.pixel_height = dim_y_field;
 	hdr.pixel_depth = (dim_z_field == 1) ? 0 : dim_z_field;
@@ -1856,6 +1957,32 @@ struct dds_header_dx10
 #define DDS_MAGIC 0x20534444
 #define DX10_MAGIC 0x30315844
 
+// DXGI formats which declare sRGB encoded data
+#define DXGI_FORMAT_R8G8B8A8_UNORM_SRGB  29
+#define DXGI_FORMAT_B8G8R8A8_UNORM_SRGB  91
+#define DXGI_FORMAT_B8G8R8X8_UNORM_SRGB  93
+
+/**
+ * @brief Determine if a DXGI format declares sRGB encoded data.
+ *
+ * @param dxgi_format   The DXGI format value from the DDS DX10 header.
+ *
+ * @return @c true if the format declares sRGB encoded data, @c false otherwise.
+ */
+static bool dxgi_format_is_srgb(
+	uint32_t dxgi_format
+) {
+	switch (dxgi_format)
+	{
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+		return true;
+	default:
+		return false;
+	}
+}
+
 /**
  * @brief Load an uncompressed DDS image using the local custom loader.
  *
@@ -1863,6 +1990,7 @@ struct dds_header_dx10
  * @param      y_flip            Should the image be vertically flipped?
  * @param[out] is_hdr            Is this an HDR image load?
  * @param[out] component_count   The number of components in the data.
+ * @param[out] color_space       The color space declared by the file.
  *
  * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
  */
@@ -1870,7 +1998,8 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count
+	unsigned int& component_count,
+	astcenc_color_space& color_space
 ) {
 	std::ifstream file(filename, std::ios::in | std::ios::binary);
 	if (!file)
@@ -1962,6 +2091,10 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 	unsigned int components = 0;
 	scanline_transfer copy_method = R8_TO_RGBA8;
 
+	// The legacy DDS pixel format cannot declare a color space, so only a DX10 header can report
+	// one; files without a DX10 header report @c unknown
+	astcenc_color_space declared_color_space = astcenc_color_space::unknown;
+
 	// Identify the DDS pixel format
 	if (use_dx10_header)
 	{
@@ -2007,6 +2140,9 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 			{  8, 1, 1,        R8_TO_RGBA8,           DXGI_FORMAT_R8_UNORM },
 			{  8, 1, 4,     BGRA8_TO_RGBA8,     DXGI_FORMAT_B8G8R8A8_UNORM },
 			{  8, 1, 4,      BGRX8_TO_RGBA8,    DXGI_FORMAT_B8G8R8X8_UNORM },
+			{  8, 1, 4,     RGBA8_TO_RGBA8, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB },
+			{  8, 1, 4,     BGRA8_TO_RGBA8, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB },
+			{  8, 1, 4,      BGRX8_TO_RGBA8, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB },
 		};
 
 		int dxgi_modes_supported = sizeof(format_params) / sizeof(format_params[0]);
@@ -2028,6 +2164,15 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 		{
 			print_error("ERROR: Image uses unsupported DDS format '%s'\n", filename);
 			return nullptr;
+		}
+
+		if (dxgi_format_is_srgb(dx10_header.dxgi_format))
+		{
+			declared_color_space = astcenc_color_space::srgb;
+		}
+		else
+		{
+			declared_color_space = astcenc_color_space::linear;
 		}
 	}
 	else
@@ -2205,22 +2350,25 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 
 	is_hdr = bitness >= 16;
 	component_count = components;
+	color_space = declared_color_space;
 	return astc_img;
 }
 
 /**
  * @brief Save a DDS uncompressed image using a local store routine.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare for 8-bit images.
  *
  * @return @c true on error, @c false on success.
  */
 static bool store_dds_uncompressed_image(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
 	if ((img->dim_x > max_u32) || (img->dim_y > max_u32) || (img->dim_z > max_u32))
 	{
@@ -2237,7 +2385,14 @@ static bool store_dds_uncompressed_image(
 	size_t dim_z = img->dim_z;
 
 	unsigned int bitness = img->data_type == ASTCENC_TYPE_U8 ? 8 : 16;
-	unsigned int image_components = (bitness == 16) ? 4 : determine_image_components(img);
+
+	// The legacy DDS pixel format has no way to declare an sRGB color space, and the DXGI sRGB
+	// formats are all 4 component, so sRGB images always use a DX10 header and RGBA data.
+	bool is_ldr_srgb = (bitness == 8) && (color_space == astcenc_color_space::srgb);
+
+	unsigned int image_components = (bitness == 16 || is_ldr_srgb) ?
+	                                4 :
+	                                determine_image_components(img);
 
 	// Size of the image data in bytes
 	bool overflow { false };
@@ -2302,7 +2457,11 @@ static bool store_dds_uncompressed_image(
 	hdr.reserved2 = 0;
 
 	// Pixel-format data
-	if (bitness == 8)
+	if (is_ldr_srgb)
+	{
+		hdr.ddspf = dxt10_diverter;
+	}
+	else if (bitness == 8)
 	{
 		hdr.ddspf = format_of_image_components[image_components - 1];
 	}
@@ -2313,7 +2472,14 @@ static bool store_dds_uncompressed_image(
 
 	// DX10 data
 	dds_header_dx10 dx10;
-	dx10.dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	if (is_ldr_srgb)
+	{
+		dx10.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	}
+	else
+	{
+		dx10.dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	}
 	dx10.resource_dimension = (dim_z > 1) ? 4 : 3;
 	dx10.misc_flag = 0;
 	dx10.array_size = 1;
@@ -2436,7 +2602,7 @@ static bool store_dds_uncompressed_image(
 
 		file.write(reinterpret_cast<const char*>(&dds_magic), sizeof(dds_magic));
 		file.write(reinterpret_cast<const char*>(&hdr), sizeof(dds_header));
-		if (bitness > 8)
+		if (bitness > 8 || is_ldr_srgb)
 		{
 			file.write(reinterpret_cast<const char*>(&dx10), sizeof(dx10));
 		}
@@ -2458,7 +2624,8 @@ static bool store_dds_uncompressed_image(
 /**
  * @brief Image loader function pointer.
  */
-using image_loader = astcenc_image_ptr(*)(const char*, bool, bool&, unsigned int&);
+using image_loader = astcenc_image_ptr(*)(const char*, bool, bool&, unsigned int&,
+                                          astcenc_color_space&);
 
 /**
  * @brief Specs for an image loader function.
@@ -2490,7 +2657,8 @@ static const size_t loader_descr_count = sizeof(loader_descs) / sizeof(loader_de
 /**
  * @brief Image storer function pointer.
  */
-using image_storer = bool(*)(const astcenc_image*, const char*, int y_flip);
+using image_storer = bool(*)(const astcenc_image*, const char*, int y_flip,
+                             astcenc_color_space color_space);
 
 /**
  * @brief Specs for an image storer function.
@@ -2548,8 +2716,12 @@ astcenc_image_ptr load_ncimage(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count
+	unsigned int& component_count,
+	astcenc_color_space& color_space
 ) {
+	// Default to no declaration in case a loader does not set one
+	color_space = astcenc_color_space::unknown;
+
 	// Get the file extension
 	const char* eptr = strrchr(filename, '.');
 	if (!eptr)
@@ -2575,7 +2747,7 @@ astcenc_image_ptr load_ncimage(
 
 	try
 	{
-		return loader(filename, y_flip, is_hdr, component_count);
+		return loader(filename, y_flip, is_hdr, component_count, color_space);
 	}
 	catch (const std::bad_alloc &e)
 	{
@@ -2589,7 +2761,8 @@ astcenc_image_ptr load_ncimage(
 bool store_ncimage(
 	const astcenc_image* output_image,
 	const char* filename,
-	int y_flip
+	int y_flip,
+	astcenc_color_space color_space
 ) {
 	const char* eptr = strrchr(filename, '.');
 	if (!eptr)
@@ -2616,7 +2789,7 @@ bool store_ncimage(
 		return true;
 	}
 
-	return storer(output_image, filename, y_flip);
+	return storer(output_image, filename, y_flip, color_space);
 }
 
 /* ============================================================================

@@ -38,6 +38,24 @@
 #define ASTCENC_UNUSED(x) ((void)x)
 
 /**
+ * @brief The color space declared by an uncompressed image file.
+ *
+ * Only container formats which declare a color space (KTX and DDS) report a
+ * value other than @c astcenc_color_space::unknown. Formats which do not
+ * declare a color space, such as PNG or JPEG, always report @c unknown so
+ * that callers do not assume a color space which was never stated.
+ */
+enum class astcenc_color_space
+{
+	/** @brief The file does not declare a color space. */
+	unknown = 0,
+	/** @brief The file declares linear-encoded color data. */
+	linear,
+	/** @brief The file declares sRGB-encoded color data. */
+	srgb
+};
+
+/**
  * @brief The payload stored in a compressed ASTC image.
  */
 struct astc_compressed_image
@@ -164,6 +182,7 @@ using astcenc_image_ptr = std::unique_ptr<astcenc_image, astcenc_image_deleter>;
  * @param      y_flip            Should this image be Y flipped?
  * @param[out] is_hdr            Is the loaded image HDR?
  * @param[out] component_count   The number of components in the loaded image.
+ * @param[out] color_space       The color space declared by the file.
  *
  * @return The loaded image, or @c nullptr on error.
  */
@@ -171,7 +190,8 @@ astcenc_image_ptr load_ncimage(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count);
+	unsigned int& component_count,
+	astcenc_color_space& color_space);
 
 /**
  * @brief Load uncompressed PNG image.
@@ -180,6 +200,7 @@ astcenc_image_ptr load_ncimage(
  * @param      y_flip            Should this image be Y flipped?
  * @param[out] is_hdr            Is the loaded image HDR?
  * @param[out] component_count   The number of components in the loaded image.
+ * @param[out] color_space       The color space declared by the file.
  *
  * @return The loaded image, or @c nullptr on error.
  */
@@ -187,21 +208,24 @@ astcenc_image_ptr load_png_with_wuffs(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count);
+	unsigned int& component_count,
+	astcenc_color_space& color_space);
 
 /**
  * @brief Save an uncompressed image.
  *
- * @param img        The source data for the image.
- * @param filename   The name of the file to save.
- * @param y_flip     Should the image be vertically flipped?
+ * @param img          The source data for the image.
+ * @param filename     The name of the file to save.
+ * @param y_flip       Should the image be vertically flipped?
+ * @param color_space  The color space to declare in container formats.
  *
  * @return @c true on error, @c false on success.
  */
 bool store_ncimage(
 	const astcenc_image* img,
 	const char* filename,
-	int y_flip);
+	int y_flip,
+	astcenc_color_space color_space);
 
 /**
  * @brief Check if the output file type requires a specific bitness.

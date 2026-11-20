@@ -88,6 +88,7 @@ struct wuffs_image_deleter
  * @param      y_flip            Should the image be vertically flipped?
  * @param[out] is_hdr            Is this an HDR image load?
  * @param[out] component_count   The number of components in the data.
+ * @param[out] color_space       The color space declared by the file.
  *
  * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
  */
@@ -95,10 +96,12 @@ astcenc_image_ptr load_png_with_wuffs(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
-	unsigned int& component_count
+	unsigned int& component_count,
+	astcenc_color_space& color_space
 ) {
 	is_hdr = false;
 	component_count = 4;
+	color_space = astcenc_color_space::unknown;
 
 	std::ifstream file(filename, std::ios::binary | std::ios::ate);
 	if (!file)

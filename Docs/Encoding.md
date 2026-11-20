@@ -216,6 +216,18 @@ encoded data.
 *Important:* The uncompressed input texture provided on the command line must
 be stored in the sRGB color space for `-cs` to function correctly.
 
+Uncompressed `.ktx` and `.dds` input files can declare their color space in
+the container header. If this declaration conflicts with the color profile
+selected on the command line the tool reports a warning, but the texel values
+are always used unchanged. Formats which cannot declare a color space, such as
+PNG, never trigger this warning.
+
+When decompressing sRGB LDR data to an 8-bit `.ktx` or `.dds` container the
+output is written using an sRGB internal format (`GL_SRGB8_ALPHA8` or
+`DXGI_FORMAT_R8G8B8A8_UNORM_SRGB`), so a graphics API can sample the texture
+with hardware sRGB decode. Linear LDR and floating-point output retain their
+existing format declarations.
+
 ## Encoding HDR data
 
 HDR data can be encoded just like LDR data, but with some caveats around

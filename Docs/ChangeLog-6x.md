@@ -116,6 +116,14 @@ header from the same release to avoid compatibility issues.
     side. An explicit `-mpsnr` range overrides automatic exposure selection.
   * **Feature:** Add crop region support for compression. Crop regions are
     extracted in the image coordinate space before flipping or preprocessing.
+  * **Feature:** Preserve the color space of uncompressed `.ktx` and `.dds`
+    container images. Files which declare sRGB or linear data now report a
+    warning if the declaration conflicts with the selected color profile,
+    while leaving the texel values unchanged. Decompressing an sRGB profile to
+    an 8-bit `.ktx` or `.dds` container now writes an sRGB internal format
+    (`GL_SRGB8_ALPHA8` or `DXGI_FORMAT_R8G8B8A8_UNORM_SRGB`), so a graphics
+    API can sample the texture with hardware sRGB decode. Linear and
+    floating-point output retains its existing format declaration.
 * **Build system updates:**
   * **Bug fix:** Restore Clang compression performance by disabling unintended
     floating-point trapping, retaining precise arithmetic and the configured
