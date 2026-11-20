@@ -907,6 +907,10 @@ ASTCENC_PUBLIC enum astcenc_error astcenc_compress_cancel(
  * and reported as @c ASTCENC_ERR_BAD_BLOCK. All assigned blocks are decoded even if an error is
  * found. Valid image content that matches an error color does not cause a failure.
  *
+ * Images using an HDR profile always decode as fp16 values, matching the GPU decode. Storing to
+ * an @c ASTCENC_TYPE_U8 output image clamps the fp16 components to the [0, 1] range and quantizes
+ * to unorm8; the LDR decode_unorm8 rounding is never applied to HDR profiles.
+ *
  * For multi-threaded contexts, each call reports errors in the blocks assigned to that thread.
  * The caller must check the return value from every worker thread to detect all decode errors.
  *

@@ -2831,11 +2831,12 @@ int astcenc_main(
 	int out_bitness = 0;
 	if (operation & ASTCENC_STAGE_DECOMPRESS)
 	{
+		bool is_hdr = (config.profile == ASTCENC_PRF_HDR) ||
+		              (config.profile == ASTCENC_PRF_HDR_RGB_LDR_A);
+
 		out_bitness = get_output_filename_enforced_bitness(output_filename.c_str());
 		if (out_bitness == 0)
 		{
-			bool is_hdr = (config.profile == ASTCENC_PRF_HDR) ||
-			              (config.profile == ASTCENC_PRF_HDR_RGB_LDR_A);
 			if (is_hdr)
 			{
 				out_bitness = 16;
@@ -2854,8 +2855,10 @@ int astcenc_main(
 			out_bitness = 16;
 		}
 
-		// If decompressed output is unorm8 then force the decode_unorm8 heuristics for compression
-		if (out_bitness == 8)
+		// If decompressed output is unorm8 then force the decode_unorm8 heuristics for
+		// compression. This only applies to LDR profiles; HDR profiles always decode as
+		// fp16 and clamp to the [0, 1] range when storing to an 8-bit output image.
+		if ((out_bitness == 8) && !is_hdr)
 		{
 			config.flags |= ASTCENC_FLG_USE_DECODE_UNORM8;
 		}

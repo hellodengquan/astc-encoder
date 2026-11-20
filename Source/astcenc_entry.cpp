@@ -1408,8 +1408,12 @@ astcenc_error astcenc_decompress_image(
 	image_block blk {};
 	blk.texel_count = static_cast<uint8_t>(block_x * block_y * block_z);
 
-	// Decode mode inferred from the output data type
-	blk.decode_unorm8 = image_out.data_type == ASTCENC_TYPE_U8;
+	// Decode mode inferred from the output data type. HDR profiles always decode
+	// as fp16, matching the GPU; the unorm8 store clamps values to the [0, 1]
+	// range and quantizes, so must not use the LDR decode_unorm8 rounding.
+	bool is_hdr = (ctx->config.profile == ASTCENC_PRF_HDR) ||
+	              (ctx->config.profile == ASTCENC_PRF_HDR_RGB_LDR_A);
+	blk.decode_unorm8 = !is_hdr && (image_out.data_type == ASTCENC_TYPE_U8);
 
 	// If context thread count is one then implicitly reset
 	if (ctx->thread_count == 1)
