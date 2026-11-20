@@ -417,9 +417,10 @@ large number of pixel formats.
 
 The following restrictions apply to loading of these file formats:
 
-    * Only uncompressed data supported
-    * Only first mipmap in mipmap pyramid supported
-    * KTX: Cube-map arrays are not supported
+    * Only uncompressed data is supported by the image loaders; compressed
+      ASTC data is handled by the separate compressed KTX texture loader
+    * The full mipmap pyramid, 2D texture arrays, cube maps, and cube map
+      arrays are loaded as independent sub-images and preserved on output
 ============================================================================ */
 enum scanline_transfer
 {
@@ -960,16 +961,33 @@ static void ktx_header_switch_endianness(ktx_header * kt)
 }
 
 /**
- * @brief Load an uncompressed KTX image using the local custom loader.
+ * @brief Compute the dimension of a mipmap level, rounded down to a minimum of one.
+ *
+ * @param base_dim   The dimension of the base mip level.
+ * @param level      The mip level index, zero based.
+ *
+ * @return The dimension at the requested level.
+ */
+static size_t mip_level_dim(
+	size_t base_dim,
+	unsigned int level
+) {
+	return astc::max<size_t>(base_dim >> level, 1);
+}
+
+/**
+ * @brief Load an uncompressed KTX texture using the local custom loader.
+ *
+ * All mipmap levels, array layers, and cube faces in the file are loaded.
  *
  * @param      filename          The name of the file to load.
  * @param      y_flip            Should the image be vertically flipped?
  * @param[out] is_hdr            Is this an HDR image load?
  * @param[out] component_count   The number of components in the data.
  *
- * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
+ * @return The loaded texture in a canonical 4 channel format, or @c nullptr on error.
  */
-static astcenc_image_ptr load_ktx_uncompressed_image(
+static std::unique_ptr<astcenc_texture> load_ktx_uncompressed_texture(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
@@ -990,14 +1008,18 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 		return nullptr;
 	}
 
-	if (memcmp(hdr.magic, ktx_magic, 12) != 0 || (hdr.endianness != 0x04030201 && hdr.endianness != 0x01020304))
+	// The endianness field stores 0x04030201 in the file's own byte order. A matching host reads
+	// that value directly; a mismatched host instead reads the byte-swapped 0x01020304, which is
+	// the signal to reverse every header and data word.
+	if (memcmp(hdr.magic, ktx_magic, 12) != 0 ||
+	    (hdr.endianness != 0x04030201 && hdr.endianness != 0x01020304))
 	{
 		print_error("ERROR: Image header corrupt '%s'\n", filename);
 		return nullptr;
 	}
 
 	bool switch_endianness = false;
-	if (hdr.endianness == 0x01020304)
+	if (hdr.endianness != 0x04030201)
 	{
 		ktx_header_switch_endianness(&hdr);
 		switch_endianness = true;
@@ -1189,24 +1211,42 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 		return nullptr;
 	}
 
-	if (hdr.number_of_mipmap_levels > 1)
+	// Resolve the resource layout
+	size_t base_x = hdr.pixel_width;
+	size_t base_y = astc::max(hdr.pixel_height, 1u);
+	size_t base_z = astc::max(hdr.pixel_depth, 1u);
+
+	unsigned int mip_count = astc::max(hdr.number_of_mipmap_levels, 1u);
+	unsigned int face_count = hdr.number_of_faces == 6 ? 6u : 1u;
+	unsigned int array_count = astc::max(hdr.number_of_array_elements, 1u);
+
+	bool is_cube = face_count == 6;
+	bool is_3d = hdr.pixel_depth > 1;
+
+	texture_type tex_type = texture_type::TEX_2D;
+	if (is_3d)
 	{
-		printf("WARNING: Only the first of %u mipmap levels will be compressed '%s'.\n", hdr.number_of_mipmap_levels, filename);
+		tex_type = texture_type::TEX_3D;
+	}
+	else if (is_cube && (array_count > 1))
+	{
+		tex_type = texture_type::TEX_CUBE_ARRAY;
+	}
+	else if (is_cube)
+	{
+		tex_type = texture_type::TEX_CUBE;
+	}
+	else if (array_count > 1)
+	{
+		tex_type = texture_type::TEX_2D_ARRAY;
 	}
 
-	if (hdr.number_of_array_elements > 1)
+	// Cube map arrays are the one combination this loader does not support
+	if (is_cube && is_3d)
 	{
-		printf("WARNING: Only the first of %u array layers will be compressed '%s'.\n", hdr.number_of_array_elements, filename);
+		print_error("ERROR: Cube map 3D textures are not supported '%s'\n", filename);
+		return nullptr;
 	}
-
-	if (hdr.number_of_faces > 1)
-	{
-		printf("WARNING: Only the first of %u cube faces will be compressed '%s'.\n", hdr.number_of_faces, filename);
-	}
-
-	size_t dim_x = hdr.pixel_width;
-	size_t dim_y = astc::max(hdr.pixel_height, 1u);
-	size_t dim_z = astc::max(hdr.pixel_depth, 1u);
 
 	// Ignore the key/value data
 	file.seekg(hdr.bytes_of_key_value_data, std::ios::cur);
@@ -1216,133 +1256,190 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 		return nullptr;
 	}
 
-	uint32_t specified_bytes_per_image = 0;
-	file.read(reinterpret_cast<char*>(&specified_bytes_per_image), sizeof(specified_bytes_per_image));
-	if (file.fail())
-	{
-		print_error("ERROR: File read failed '%s'\n", filename);
-		return nullptr;
-	}
+	auto texture = std::make_unique<astcenc_texture>();
+	texture->type = tex_type;
+	texture->mip_count = mip_count;
+	texture->array_count = array_count;
+	texture->face_count = face_count;
+	texture->is_hdr = bitness >= 16;
+	texture->format.gl_type = hdr.gl_type;
+	texture->format.gl_type_size = hdr.gl_type_size;
+	texture->format.gl_format = hdr.gl_format;
+	texture->format.gl_internal_format = hdr.gl_internal_format;
+	texture->format.components = components;
 
-	if (switch_endianness)
-	{
-		specified_bytes_per_image = reverse_bytes_u32(specified_bytes_per_image);
-	}
-
-	// Compute surface size, checking for overflow caused by bad user-defined sizes
-	// These values are trusted and cannot overflow
 	size_t bytes_per_pixel = bytes_per_component * components;
 
-	bool overflow { false };
-
-	size_t bytes_per_row = astc::mul_safe(bytes_per_pixel, dim_x, overflow);
-
-	// KTX rows must be padded to four bytes, including the final row
-	size_t padded_row = (bytes_per_row + 3) & ~static_cast<size_t>(3);
-	overflow = overflow || (padded_row < bytes_per_row);
-	bytes_per_row = padded_row;
-
-	size_t bytes_per_plane = astc::mul_safe(bytes_per_row, dim_y, overflow);
-	size_t bytes_per_image = astc::mul_safe(bytes_per_plane, dim_z, overflow);
-
-	// KTX imageSize includes all array layers and faces, except for non-array cubemaps
-	size_t bytes_per_mip = bytes_per_image;
-	if (hdr.number_of_array_elements > 0)
+	for (unsigned int mip = 0; mip < mip_count; mip++)
 	{
-		bytes_per_mip = astc::mul_safe(bytes_per_mip, hdr.number_of_array_elements, overflow);
-		bytes_per_mip = astc::mul_safe(bytes_per_mip, hdr.number_of_faces, overflow);
-	}
-
-	// Also verify that our output plane allocation does not overflow because this always uses 4
-	// components which can be more than the input file used
-	size_t plane_texels = astc::mul_safe(dim_x, dim_y, overflow);
-	astc::mul_safe(plane_texels, 4, overflow);
-
-	if (overflow || (bytes_per_mip != specified_bytes_per_image))
-	{
-		print_error("ERROR: Image header corrupt '%s'\n", filename);
-		return nullptr;
-	}
-
-	std::unique_ptr<uint8_t[]> buf;
-	try
-	{
-		buf = std::make_unique<uint8_t[]>(bytes_per_image);
-	}
-	catch (const std::bad_alloc &e)
-	{
-		ASTCENC_UNUSED(e);
-		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
-		return nullptr;
-	}
-
-	file.read(reinterpret_cast<char*>(buf.get()), bytes_per_image);
-	if (file.fail())
-	{
-		print_error("ERROR: File read failed '%s'\n", filename);
-		return nullptr;
-	}
-
-	// Perform an endianness swap on the surface if needed
-	if (switch_endianness)
-	{
-		if (hdr.gl_type_size == 2)
+		// KTX imageSize covers every array layer and face in this level (non-array cubemaps
+		// store six faces but the header array count is zero)
+		uint32_t specified_bytes_per_image = 0;
+		file.read(reinterpret_cast<char*>(&specified_bytes_per_image), sizeof(specified_bytes_per_image));
+		if (file.fail())
 		{
-			switch_endianness2(buf.get(), bytes_per_image);
+			print_error("ERROR: File read failed '%s'\n", filename);
+			return nullptr;
 		}
 
-		if (hdr.gl_type_size == 4)
+		if (switch_endianness)
 		{
-			switch_endianness4(buf.get(), bytes_per_image);
+			specified_bytes_per_image = reverse_bytes_u32(specified_bytes_per_image);
 		}
-	}
 
-	// Transfer data from the surface to our own image data structure
-	astcenc_image_ptr astc_img;
-	try
-	{
-		astc_img = alloc_image(bitness, dim_x, dim_y, dim_z);
-	}
-	catch (const std::bad_alloc &e)
-	{
-		ASTCENC_UNUSED(e);
-		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
-		return nullptr;
-	}
+		size_t dim_x = mip_level_dim(base_x, mip);
+		size_t dim_y = mip_level_dim(base_y, mip);
+		// 3D texture depth shrinks per level; 2D resources always have depth 1
+		size_t dim_z = is_3d ? mip_level_dim(base_z, mip) : 1;
 
-	if (!astc_img)
-	{
-		print_error("ERROR: Image memory size overflow\n");
-		return nullptr;
-	}
+		bool overflow { false };
+		size_t bytes_per_row = astc::mul_safe(bytes_per_pixel, dim_x, overflow);
 
-	for (size_t z = 0; z < dim_z; z++)
-	{
-		for (size_t y = 0; y < dim_y; y++)
+		// KTX rows must be padded to four bytes, including the final row
+		size_t padded_row = (bytes_per_row + 3) & ~static_cast<size_t>(3);
+		overflow = overflow || (padded_row < bytes_per_row);
+		bytes_per_row = padded_row;
+
+		size_t bytes_per_plane = astc::mul_safe(bytes_per_row, dim_y, overflow);
+		size_t bytes_per_subimage = astc::mul_safe(bytes_per_plane, dim_z, overflow);
+
+		unsigned int level_array_count = is_3d ? 1u : array_count;
+		unsigned int level_face_count = is_3d ? 1u : face_count;
+		size_t level_subimages = astc::mul_safe(level_array_count, level_face_count, overflow);
+		size_t bytes_per_mip = astc::mul_safe(bytes_per_subimage, level_subimages, overflow);
+
+		// Also verify that our output plane allocation does not overflow because this always
+		// uses 4 components which can be more than the input file used
+		size_t plane_texels = astc::mul_safe(dim_x, dim_y, overflow);
+		astc::mul_safe(plane_texels, 4, overflow);
+
+		if (overflow || (bytes_per_mip != specified_bytes_per_image))
 		{
-			size_t mod_y = y_flip ? dim_y - y - 1 : y;
-			void *dst;
+			print_error("ERROR: Image header corrupt '%s'\n", filename);
+			return nullptr;
+		}
 
-			if (astc_img->data_type == ASTCENC_TYPE_U8)
+		std::unique_ptr<uint8_t[]> buf;
+		try
+		{
+			buf = std::make_unique<uint8_t[]>(bytes_per_mip);
+		}
+		catch (const std::bad_alloc &e)
+		{
+			ASTCENC_UNUSED(e);
+			print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+			return nullptr;
+		}
+
+		file.read(reinterpret_cast<char*>(buf.get()), bytes_per_mip);
+		if (file.fail())
+		{
+			print_error("ERROR: File read failed '%s'\n", filename);
+			return nullptr;
+		}
+
+		// Perform an endianness swap on the surface if needed
+		if (switch_endianness)
+		{
+			if (hdr.gl_type_size == 2)
 			{
-				uint8_t* data8 = static_cast<uint8_t*>(astc_img->data[z]);
-				dst = static_cast<void*>(&data8[4 * dim_x * mod_y]);
-			}
-			else  // if (astc_img->data_type == ASTCENC_TYPE_F16)
-			{
-				assert(astc_img->data_type == ASTCENC_TYPE_F16);
-				uint16_t* data16 = static_cast<uint16_t*>(astc_img->data[z]);
-				dst = static_cast<void*>(&data16[4 * dim_x * mod_y]);
+				switch_endianness2(buf.get(), bytes_per_mip);
 			}
 
-			uint8_t *src = buf.get() + (z * bytes_per_plane) + (y * bytes_per_row);
-			copy_scanline(dst, src, dim_x, copy_method);
+			if (hdr.gl_type_size == 4)
+			{
+				switch_endianness4(buf.get(), bytes_per_mip);
+			}
+		}
+
+		// Split the level payload into canonical sub-images; for a 3D texture all depth slices
+		// stay inside one image, otherwise layers and faces are independent images
+		for (unsigned int layer = 0; layer < level_array_count; layer++)
+		{
+			for (unsigned int face = 0; face < level_face_count; face++)
+			{
+				size_t sub_index = (static_cast<size_t>(layer) * level_face_count) + face;
+				const uint8_t* sub_src = buf.get() + (sub_index * bytes_per_subimage);
+
+				astcenc_image_ptr astc_img;
+				try
+				{
+					astc_img = alloc_image(bitness, dim_x, dim_y, dim_z);
+				}
+				catch (const std::bad_alloc &e)
+				{
+					ASTCENC_UNUSED(e);
+					print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+					return nullptr;
+				}
+
+				if (!astc_img)
+				{
+					print_error("ERROR: Image memory size overflow\n");
+					return nullptr;
+				}
+
+				for (size_t z = 0; z < dim_z; z++)
+				{
+					for (size_t y = 0; y < dim_y; y++)
+					{
+						size_t mod_y = y_flip ? dim_y - y - 1 : y;
+						void* dst;
+
+						if (astc_img->data_type == ASTCENC_TYPE_U8)
+						{
+							uint8_t* data8 = static_cast<uint8_t*>(astc_img->data[z]);
+							dst = static_cast<void*>(&data8[4 * dim_x * mod_y]);
+						}
+						else  // if (astc_img->data_type == ASTCENC_TYPE_F16)
+						{
+							assert(astc_img->data_type == ASTCENC_TYPE_F16);
+							uint16_t* data16 = static_cast<uint16_t*>(astc_img->data[z]);
+							dst = static_cast<void*>(&data16[4 * dim_x * mod_y]);
+						}
+
+						const uint8_t* src = sub_src + (z * bytes_per_plane) + (y * bytes_per_row);
+						copy_scanline(dst, src, dim_x, copy_method);
+					}
+				}
+
+				texture->images.push_back(std::move(astc_img));
+			}
 		}
 	}
 
 	is_hdr = bitness >= 16;
 	component_count = components;
-	return astc_img;
+	return texture;
+}
+
+/**
+ * @brief Load an uncompressed KTX image using the local custom loader.
+ *
+ * This is a backwards-compatible wrapper around the full texture loader, returning only the
+ * first mip level, array layer, and cube face.
+ *
+ * @param      filename          The name of the file to load.
+ * @param      y_flip            Should the image be vertically flipped?
+ * @param[out] is_hdr            Is this an HDR image load?
+ * @param[out] component_count   The number of components in the data.
+ *
+ * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
+ */
+static astcenc_image_ptr load_ktx_uncompressed_image(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count
+) {
+	auto texture = load_ktx_uncompressed_texture(filename, y_flip, is_hdr, component_count);
+	if (!texture || texture->images.empty())
+	{
+		return nullptr;
+	}
+
+	astcenc_image_ptr result = std::move(texture->images[0]);
+	return result;
 }
 
 /**
@@ -1382,7 +1479,7 @@ bool load_ktx_compressed_image(
 	}
 
 	bool switch_endianness = false;
-	if (hdr.endianness == 0x01020304)
+	if (hdr.endianness != 0x04030201)
 	{
 		switch_endianness = true;
 		ktx_header_switch_endianness(&hdr);
@@ -1470,6 +1567,206 @@ bool load_ktx_compressed_image(
 }
 
 /**
+ * @brief Load a full KTX compressed texture using the local custom loader.
+ *
+ * All mip levels, array layers, and cube faces are loaded as independent ASTC sub-images.
+ *
+ * @param      filename   The name of the file to load.
+ * @param[out] texture    The output texture to populate.
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool load_ktx_compressed_texture(
+	const char* filename,
+	astc_compressed_texture& texture
+) {
+	std::ifstream file(filename, std::ios::in | std::ios::binary);
+	if (!file)
+	{
+		print_error("ERROR: File open failed '%s'\n", filename);
+		return true;
+	}
+
+	ktx_header hdr;
+	file.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+	if (file.fail())
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		return true;
+	}
+
+	if (memcmp(hdr.magic, ktx_magic, 12) != 0 ||
+	    (hdr.endianness != 0x04030201 && hdr.endianness != 0x01020304))
+	{
+		print_error("ERROR: Image header corrupt '%s'\n", filename);
+		return true;
+	}
+
+	bool switch_endianness = false;
+	if (hdr.endianness != 0x04030201)
+	{
+		switch_endianness = true;
+		ktx_header_switch_endianness(&hdr);
+	}
+
+	if (hdr.gl_type != 0 || hdr.gl_format != 0 || hdr.gl_type_size != 1 ||
+	    hdr.gl_base_internal_format != GL_RGBA)
+	{
+		print_error("ERROR: Image uses unsupported KTX format '%s'\n", filename);
+		return true;
+	}
+
+	const format_entry* fmt = get_format(hdr.gl_internal_format);
+	if (!fmt)
+	{
+		print_error("ERROR: Image uses unsupported KTX format '%s'\n", filename);
+		return true;
+	}
+
+	unsigned int block_x = fmt->x;
+	unsigned int block_y = fmt->y;
+	unsigned int block_z = fmt->z == 0 ? 1 : fmt->z;
+
+	size_t base_x = hdr.pixel_width;
+	size_t base_y = astc::max<size_t>(hdr.pixel_height, 1);
+	size_t base_z = astc::max<size_t>(hdr.pixel_depth, 1);
+
+	unsigned int mip_count = astc::max(hdr.number_of_mipmap_levels, 1u);
+	unsigned int face_count = hdr.number_of_faces == 6 ? 6u : 1u;
+	unsigned int array_count = astc::max(hdr.number_of_array_elements, 1u);
+
+	bool is_cube = face_count == 6;
+	bool is_3d = hdr.pixel_depth > 1;
+
+	texture.type = texture_type::TEX_2D;
+	if (is_3d)
+	{
+		texture.type = texture_type::TEX_3D;
+	}
+	else if (is_cube && (array_count > 1))
+	{
+		texture.type = texture_type::TEX_CUBE_ARRAY;
+	}
+	else if (is_cube)
+	{
+		texture.type = texture_type::TEX_CUBE;
+	}
+	else if (array_count > 1)
+	{
+		texture.type = texture_type::TEX_2D_ARRAY;
+	}
+
+	if (is_cube && is_3d)
+	{
+		print_error("ERROR: Cube map 3D textures are not supported '%s'\n", filename);
+		return true;
+	}
+
+	texture.mip_count = mip_count;
+	texture.array_count = array_count;
+	texture.face_count = face_count;
+	texture.is_srgb = fmt->is_srgb;
+	texture.images.clear();
+
+	// Skip over any key-value pairs
+	file.seekg(hdr.bytes_of_key_value_data, std::ios::cur);
+	if (file.fail())
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		return true;
+	}
+
+	for (unsigned int mip = 0; mip < mip_count; mip++)
+	{
+		uint32_t data_len = 0;
+		file.read(reinterpret_cast<char*>(&data_len), sizeof(data_len));
+		if (file.fail())
+		{
+			print_error("ERROR: File read failed '%s'\n", filename);
+			return true;
+		}
+
+		if (switch_endianness)
+		{
+			data_len = reverse_bytes_u32(data_len);
+		}
+
+		size_t dim_x = mip_level_dim(base_x, mip);
+		size_t dim_y = mip_level_dim(base_y, mip);
+		size_t dim_z = is_3d ? mip_level_dim(base_z, mip) : 1;
+
+		size_t blocks_x = astc::get_block_count_safe(dim_x, block_x);
+		size_t blocks_y = astc::get_block_count_safe(dim_y, block_y);
+		size_t blocks_z = astc::get_block_count_safe(dim_z, block_z);
+
+		bool overflow { false };
+		size_t subimage_bytes = astc::mul_safe(blocks_x, blocks_y, overflow);
+		subimage_bytes = astc::mul_safe(subimage_bytes, blocks_z, overflow);
+		subimage_bytes = astc::mul_safe(subimage_bytes, 16, overflow);
+
+		unsigned int level_array_count = is_3d ? 1u : array_count;
+		unsigned int level_face_count = is_3d ? 1u : face_count;
+		size_t level_subimages = astc::mul_safe(level_array_count, level_face_count, overflow);
+		size_t level_bytes = astc::mul_safe(subimage_bytes, level_subimages, overflow);
+
+		if (overflow || data_len < level_bytes)
+		{
+			print_error("ERROR: Image header corrupt '%s'\n", filename);
+			return true;
+		}
+
+		for (unsigned int layer = 0; layer < level_array_count; layer++)
+		{
+			for (unsigned int face = 0; face < level_face_count; face++)
+			{
+				astc_compressed_image subimage;
+				subimage.block_x = block_x;
+				subimage.block_y = block_y;
+				subimage.block_z = block_z;
+				subimage.dim_x = dim_x;
+				subimage.dim_y = dim_y;
+				subimage.dim_z = dim_z;
+
+				try
+				{
+					subimage.data.resize(subimage_bytes);
+				}
+				catch (const std::bad_alloc &e)
+				{
+					ASTCENC_UNUSED(e);
+					print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+					return true;
+				}
+
+				file.read(reinterpret_cast<char*>(subimage.data.data()), subimage_bytes);
+				if (file.fail())
+				{
+					print_error("ERROR: File read failed '%s'\n", filename);
+					return true;
+				}
+
+				texture.images.push_back(std::move(subimage));
+			}
+		}
+
+		// Skip any padding between KTX mip levels so the next level starts 4-byte aligned
+		size_t consumed = level_bytes;
+		size_t padding = (4 - (consumed & 3)) & 3;
+		if (padding)
+		{
+			file.seekg(static_cast<std::streamoff>(padding), std::ios::cur);
+			if (file.fail())
+			{
+				print_error("ERROR: File read failed '%s'\n", filename);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/**
  * @brief Store a KTX compressed image using a local store routine.
  *
  * @param img        The image data to store.
@@ -1530,6 +1827,127 @@ bool store_ktx_compressed_image(
 	file.write(reinterpret_cast<const char*>(&hdr), sizeof(ktx_header));
 	file.write(reinterpret_cast<const char*>(&data_len), sizeof(uint32_t));
 	file.write(reinterpret_cast<const char*>(img.data.data()), img.data.size());
+	file.close();
+	return file.fail();
+}
+
+/**
+ * @brief Store a full KTX compressed texture using a local store routine.
+ *
+ * The on-disk layout follows the KTX1 ordering: for each mip level, every array layer, then every
+ * cube face. For 3D textures the depth of each mip level is written explicitly.
+ *
+ * @param texture    The texture data to store.
+ * @param filename   The name of the file to save.
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool store_ktx_compressed_texture(
+	const astc_compressed_texture& texture,
+	const char* filename
+) {
+	const astc_compressed_image& base = texture.images.front();
+
+	bool is_3d = texture.type == texture_type::TEX_3D;
+	bool is_cube = (texture.type == texture_type::TEX_CUBE) ||
+	               (texture.type == texture_type::TEX_CUBE_ARRAY);
+
+	unsigned int fmt = get_format(base.block_x, base.block_y, base.block_z, texture.is_srgb);
+	if (fmt == 0)
+	{
+		print_error("ERROR: ASTC block size is not supported by the KTX format\n");
+		return true;
+	}
+
+	if ((base.dim_x > max_u32) || (base.dim_y > max_u32) || (base.dim_z > max_u32))
+	{
+		print_error("ERROR: Image exceeds file format size limits\n");
+		return true;
+	}
+
+	ktx_header hdr;
+	memcpy(hdr.magic, ktx_magic, 12);
+	hdr.endianness = 0x04030201;
+	hdr.gl_type = 0;
+	hdr.gl_type_size = 1;
+	hdr.gl_format = 0;
+	hdr.gl_internal_format = fmt;
+	hdr.gl_base_internal_format = GL_RGBA;
+	hdr.pixel_width = static_cast<uint32_t>(base.dim_x);
+	hdr.pixel_height = static_cast<uint32_t>(base.dim_y);
+	hdr.pixel_depth = is_3d ? static_cast<uint32_t>(base.dim_z) : 0;
+	hdr.number_of_array_elements = (texture.array_count > 1) ? texture.array_count : 0;
+	hdr.number_of_faces = is_cube ? 6u : 1u;
+	hdr.number_of_mipmap_levels = texture.mip_count;
+	hdr.bytes_of_key_value_data = 0;
+
+#if defined(ASTCENC_BIG_ENDIAN)
+	ktx_header_switch_endianness(&hdr);
+#endif
+
+	std::ofstream file(filename, std::ios::out | std::ios::binary);
+	if (!file)
+	{
+		print_error("ERROR: File open failed '%s'\n", filename);
+		return true;
+	}
+
+	file.write(reinterpret_cast<const char*>(&hdr), sizeof(ktx_header));
+
+	for (unsigned int mip = 0; mip < texture.mip_count; mip++)
+	{
+		unsigned int level_array_count = is_3d ? 1u : texture.array_count;
+		unsigned int level_face_count = is_3d ? 1u : texture.face_count;
+
+		bool overflow { false };
+		size_t level_bytes = 0;
+		for (unsigned int layer = 0; layer < level_array_count; layer++)
+		{
+			for (unsigned int face = 0; face < level_face_count; face++)
+			{
+				const astc_compressed_image& sub = texture.get_image(mip, layer, face);
+				level_bytes += sub.data.size();
+				overflow = overflow || (level_bytes < sub.data.size());
+			}
+		}
+
+		if (overflow || (level_bytes > max_u32))
+		{
+			print_error("ERROR: Image exceeds file format size limits\n");
+			return true;
+		}
+
+		uint32_t level_bytes_field = static_cast<uint32_t>(level_bytes);
+#if defined(ASTCENC_BIG_ENDIAN)
+		level_bytes_field = reverse_bytes_u32(level_bytes_field);
+#endif
+
+		file.write(reinterpret_cast<const char*>(&level_bytes_field), sizeof(uint32_t));
+
+		for (unsigned int layer = 0; layer < level_array_count; layer++)
+		{
+			for (unsigned int face = 0; face < level_face_count; face++)
+			{
+				const astc_compressed_image& sub = texture.get_image(mip, layer, face);
+				file.write(reinterpret_cast<const char*>(sub.data.data()),
+				           static_cast<std::streamsize>(sub.data.size()));
+			}
+		}
+
+		// KTX pads each mip level to a 4-byte boundary
+		uint32_t padding = (4 - (level_bytes & 3)) & 3;
+		if (padding)
+		{
+			static const uint8_t zeros[4] { 0, 0, 0, 0 };
+			file.write(reinterpret_cast<const char*>(zeros), padding);
+		}
+
+		if (file.fail())
+		{
+			return true;
+		}
+	}
+
 	file.close();
 	return file.fail();
 }
@@ -1769,6 +2187,275 @@ static bool store_ktx_uncompressed_image(
 	return error;
 }
 
+/**
+ * @brief Pack one canonical RGBA sub-image into the source container component layout.
+ *
+ * @param      img                 The source image in canonical 4 component layout.
+ * @param      format              The target source pixel format descriptor.
+ * @param      y_flip              Should the image be vertically flipped?
+ * @param[out] pixel_data8         Packed byte output, used for 8-bit formats.
+ * @param[out] pixel_data16        Packed half-float output, used for 16-bit formats.
+ * @param[out] row_bytes           The padded row stride of the packed data.
+ *
+ * @return @c true on error, @c false on success.
+ */
+static bool pack_ktx_subimage(
+	const astcenc_image* img,
+	const source_pixel_format& format,
+	int y_flip,
+	std::vector<uint8_t>& pixel_data8,
+	std::vector<uint16_t>& pixel_data16,
+	size_t& row_bytes
+) {
+	size_t dim_x = img->dim_x;
+	size_t dim_y = img->dim_y;
+	size_t dim_z = img->dim_z;
+
+	unsigned int bitness = img->data_type == ASTCENC_TYPE_U8 ? 8 : 16;
+	unsigned int components = format.components;
+
+	bool overflow { false };
+	size_t raw_row = astc::mul_safe(dim_x, components * (bitness / 8), overflow);
+	size_t padded_row = (raw_row + 3) & ~static_cast<size_t>(3);
+	overflow = overflow || (padded_row < raw_row);
+	row_bytes = padded_row;
+
+	size_t plane_bytes = astc::mul_safe(row_bytes, dim_y, overflow);
+	size_t image_bytes = astc::mul_safe(plane_bytes, dim_z, overflow);
+	if (overflow || (image_bytes > max_u32))
+	{
+		return true;
+	}
+
+	if (bitness == 8)
+	{
+		pixel_data8.assign(image_bytes, 0);
+		for (size_t z = 0; z < dim_z; z++)
+		{
+			uint8_t* data8 = static_cast<uint8_t*>(img->data[z]);
+			for (size_t y = 0; y < dim_y; y++)
+			{
+				size_t mod_y = y_flip ? dim_y - y - 1 : y;
+				uint8_t* src_row = data8 + 4 * dim_x * mod_y;
+				uint8_t* dest_row = &pixel_data8[z * plane_bytes + y * row_bytes];
+				for (size_t x = 0; x < dim_x; x++)
+				{
+					for (unsigned int c = 0; c < components; c++)
+					{
+						dest_row[components * x + c] = src_row[4 * x + c];
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		pixel_data16.assign(image_bytes / sizeof(uint16_t), 0);
+		for (size_t z = 0; z < dim_z; z++)
+		{
+			uint16_t* data16 = static_cast<uint16_t*>(img->data[z]);
+			for (size_t y = 0; y < dim_y; y++)
+			{
+				size_t mod_y = y_flip ? dim_y - y - 1 : y;
+				uint16_t* src_row = data16 + 4 * dim_x * mod_y;
+				uint16_t* dest_row = &pixel_data16[(z * plane_bytes + y * row_bytes) / sizeof(uint16_t)];
+				for (size_t x = 0; x < dim_x; x++)
+				{
+					for (unsigned int c = 0; c < components; c++)
+					{
+						dest_row[components * x + c] = src_row[4 * x + c];
+					}
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+/**
+ * @brief Store a full uncompressed KTX texture using a local store routine.
+ *
+ * Every mip level, array layer, and cube face is written in KTX1 order. The source container pixel
+ * format recorded at load time is reused so the output component layout matches the input.
+ *
+ * @param texture    The source texture.
+ * @param filename   The name of the file to save.
+ * @param y_flip     Should the image be vertically flipped?
+ *
+ * @return @c true on error, @c false on success.
+ */
+static bool store_ktx_uncompressed_texture(
+	const astcenc_texture* texture,
+	const char* filename,
+	int y_flip
+) {
+	const astcenc_image* base = texture->images.front().get();
+
+	bool is_3d = texture->type == texture_type::TEX_3D;
+	bool is_cube = (texture->type == texture_type::TEX_CUBE) ||
+	               (texture->type == texture_type::TEX_CUBE_ARRAY);
+
+	if ((base->dim_x > max_u32) || (base->dim_y > max_u32) || (base->dim_z > max_u32))
+	{
+		print_error("ERROR: Image exceeds file format size limits\n");
+		return true;
+	}
+
+	// A texture produced by decompression carries no source container format, so derive a
+	// sensible default from the component data type
+	unsigned int bitness = base->data_type == ASTCENC_TYPE_U8 ? 8 : 16;
+	unsigned int image_components = texture->format.components;
+	if ((image_components == 0) || (image_components > 4))
+	{
+		image_components = 4;
+	}
+
+	uint32_t gl_type = texture->format.gl_type;
+	uint32_t gl_type_size = texture->format.gl_type_size;
+	uint32_t gl_format = texture->format.gl_format;
+	uint32_t gl_internal_format = texture->format.gl_internal_format;
+
+	if (gl_type == 0)
+	{
+		static const uint32_t gl_format_of_components[4] {
+			GL_RED, GL_RG, GL_RGB, GL_RGBA
+		};
+
+		gl_format = gl_format_of_components[image_components - 1];
+
+		if (bitness == 16)
+		{
+			static const uint32_t hdr_formats[4] {
+				GL_R16F, GL_RG16F, GL_RGB16F, GL_RGBA16F
+			};
+			gl_type = GL_HALF_FLOAT;
+			gl_type_size = 2;
+			gl_internal_format = hdr_formats[image_components - 1];
+		}
+		else
+		{
+			static const uint32_t ldr_formats[4] {
+				GL_R8, GL_RG8, GL_RGB8, GL_RGBA8
+			};
+			gl_type = GL_UNSIGNED_BYTE;
+			gl_type_size = 1;
+			gl_internal_format = ldr_formats[image_components - 1];
+		}
+	}
+
+	ktx_header hdr;
+	memcpy(hdr.magic, ktx_magic, 12);
+	hdr.endianness = 0x04030201;
+	hdr.gl_type = gl_type;
+	hdr.gl_type_size = gl_type_size;
+	hdr.gl_format = gl_format;
+	hdr.gl_internal_format = gl_internal_format;
+	hdr.gl_base_internal_format = gl_format;
+	hdr.pixel_width = static_cast<uint32_t>(base->dim_x);
+	hdr.pixel_height = static_cast<uint32_t>(base->dim_y);
+	hdr.pixel_depth = is_3d ? static_cast<uint32_t>(base->dim_z) : 0;
+	hdr.number_of_array_elements = (texture->array_count > 1) ? texture->array_count : 0;
+	hdr.number_of_faces = is_cube ? 6u : 1u;
+	hdr.number_of_mipmap_levels = texture->mip_count;
+	hdr.bytes_of_key_value_data = 0;
+
+#if defined(ASTCENC_BIG_ENDIAN)
+	ktx_header_switch_endianness(&hdr);
+#endif
+
+	std::ofstream file(filename, std::ios::out | std::ios::binary);
+	if (!file)
+	{
+		print_error("ERROR: File open failed '%s'\n", filename);
+		return true;
+	}
+
+	file.write(reinterpret_cast<const char*>(&hdr), sizeof(ktx_header));
+
+	for (unsigned int mip = 0; mip < texture->mip_count; mip++)
+	{
+		unsigned int level_array_count = is_3d ? 1u : texture->array_count;
+		unsigned int level_face_count = is_3d ? 1u : texture->face_count;
+
+		// Pack every sub-image first so the level size is known
+		std::vector<std::vector<uint8_t>> level_data8(level_array_count * level_face_count);
+		std::vector<std::vector<uint16_t>> level_data16(level_array_count * level_face_count);
+		std::vector<size_t> level_row_bytes(level_array_count * level_face_count);
+
+		bool overflow { false };
+		size_t level_bytes = 0;
+
+		for (unsigned int layer = 0; layer < level_array_count; layer++)
+		{
+			for (unsigned int face = 0; face < level_face_count; face++)
+			{
+				size_t sub_index = (static_cast<size_t>(layer) * level_face_count) + face;
+				const astcenc_image* sub = texture->get_image(mip, layer, face);
+
+				bool pack_error = pack_ktx_subimage(
+				    sub, texture->format, y_flip,
+				    level_data8[sub_index], level_data16[sub_index],
+				    level_row_bytes[sub_index]);
+				if (pack_error)
+				{
+					print_error("ERROR: Image exceeds file format size limits\n");
+					return true;
+				}
+
+				size_t sub_bytes = level_data8[sub_index].empty()
+				                 ? level_data16[sub_index].size() * sizeof(uint16_t)
+				                 : level_data8[sub_index].size();
+				level_bytes += sub_bytes;
+				overflow = overflow || (level_bytes < sub_bytes);
+			}
+		}
+
+		if (overflow || (level_bytes > max_u32))
+		{
+			print_error("ERROR: Image exceeds file format size limits\n");
+			return true;
+		}
+
+		uint32_t level_bytes_field = static_cast<uint32_t>(level_bytes);
+#if defined(ASTCENC_BIG_ENDIAN)
+		level_bytes_field = reverse_bytes_u32(level_bytes_field);
+#endif
+
+		file.write(reinterpret_cast<const char*>(&level_bytes_field), sizeof(uint32_t));
+
+		for (size_t sub_index = 0; sub_index < level_array_count * level_face_count; sub_index++)
+		{
+			if (!level_data8[sub_index].empty())
+			{
+				file.write(reinterpret_cast<const char*>(level_data8[sub_index].data()),
+				           static_cast<std::streamsize>(level_data8[sub_index].size()));
+			}
+			else
+			{
+				file.write(reinterpret_cast<const char*>(level_data16[sub_index].data()),
+				           static_cast<std::streamsize>(level_data16[sub_index].size() * sizeof(uint16_t)));
+			}
+		}
+
+		// KTX pads each mip level to a 4-byte boundary
+		uint32_t padding = (4 - (level_bytes & 3)) & 3;
+		if (padding)
+		{
+			static const uint8_t zeros[4] { 0, 0, 0, 0 };
+			file.write(reinterpret_cast<const char*>(zeros), padding);
+		}
+
+		if (file.fail())
+		{
+			return true;
+		}
+	}
+
+	file.close();
+	return file.fail();
+}
+
 /*
 	Loader for DDS files.
 
@@ -1857,16 +2544,18 @@ struct dds_header_dx10
 #define DX10_MAGIC 0x30315844
 
 /**
- * @brief Load an uncompressed DDS image using the local custom loader.
+ * @brief Load an uncompressed DDS texture using the local custom loader.
+ *
+ * All mipmap levels, array layers (DX10), and cube faces are loaded as independent sub-images.
  *
  * @param      filename          The name of the file to load.
  * @param      y_flip            Should the image be vertically flipped?
  * @param[out] is_hdr            Is this an HDR image load?
  * @param[out] component_count   The number of components in the data.
  *
- * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
+ * @return The loaded texture in a canonical 4 channel format, or @c nullptr on error.
  */
-static astcenc_image_ptr load_dds_uncompressed_image(
+static std::unique_ptr<astcenc_texture> load_dds_uncompressed_texture(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
@@ -1939,7 +2628,7 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 		}
 	}
 
-	dds_header_dx10 dx10_header;
+	dds_header_dx10 dx10_header {};
 	if (use_dx10_header)
 	{
 		file.read(reinterpret_cast<char*>(&dx10_header), sizeof(dx10_header));
@@ -1950,9 +2639,38 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 		}
 	}
 
-	size_t dim_x = hdr.width;
-	size_t dim_y = hdr.height;
-	size_t dim_z = (hdr.flags & 0x800000) ? hdr.depth : 1;
+	size_t base_x = hdr.width;
+	size_t base_y = hdr.height;
+	size_t base_z = (hdr.flags & 0x800000) ? hdr.depth : 1;
+
+	bool is_3d = (hdr.caps2 & 0x200000) != 0;
+	bool is_cube = (hdr.caps2 & 0x200) != 0;
+
+	unsigned int mip_count = (hdr.mipmapcount > 0) ? hdr.mipmapcount : 1u;
+	unsigned int array_count = 1;
+	if (use_dx10_header && (dx10_header.array_size > 1))
+	{
+		array_count = dx10_header.array_size;
+	}
+
+	// A full cubemap must declare all six faces; partial cubemaps are not supported
+	unsigned int face_count = 1;
+	if (is_cube)
+	{
+		const uint32_t all_faces = 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
+		if ((hdr.caps2 & all_faces) != all_faces)
+		{
+			print_error("ERROR: Partial cube maps are not supported '%s'\n", filename);
+			return nullptr;
+		}
+		face_count = 6;
+	}
+
+	if (is_3d && is_cube)
+	{
+		print_error("ERROR: Cube map 3D textures are not supported '%s'\n", filename);
+		return nullptr;
+	}
 
 	// Internal codec bit depth
 	unsigned int bitness = 0;
@@ -2120,92 +2838,164 @@ static astcenc_image_ptr load_dds_uncompressed_image(
 		bitness = bytes_per_component * 8;
 	}
 
-	// Compute surface size, checking for overflow caused by bad user-defined sizes
-	// These values are trusted and cannot overflow
+	// DDS data is densely packed, with no row or surface padding
 	size_t bytes_per_pixel = bytes_per_component * components;
 
-	// These values are not and can overflow
-	bool overflow { false };
-	size_t bytes_per_row = astc::mul_safe(bytes_per_pixel, dim_x, overflow);
-	size_t bytes_per_plane = astc::mul_safe(bytes_per_row, dim_y, overflow);
-	size_t bytes_per_image = astc::mul_safe(bytes_per_plane, dim_z, overflow);
-
-	// Also verify that our output plane allocation does not overflow because this always uses 4
-	// components which can be more than the input file used
-	size_t plane_texels = astc::mul_safe(dim_x, dim_y, overflow);
-	astc::mul_safe(plane_texels, 4, overflow);
-
-	if (overflow)
+	auto texture = std::make_unique<astcenc_texture>();
+	texture->type = texture_type::TEX_2D;
+	if (is_3d)
 	{
-		print_error("ERROR: Image header corrupt '%s'\n", filename);
-		return nullptr;
+		texture->type = texture_type::TEX_3D;
+	}
+	else if (is_cube && (array_count > 1))
+	{
+		texture->type = texture_type::TEX_CUBE_ARRAY;
+	}
+	else if (is_cube)
+	{
+		texture->type = texture_type::TEX_CUBE;
+	}
+	else if (array_count > 1)
+	{
+		texture->type = texture_type::TEX_2D_ARRAY;
 	}
 
-	std::unique_ptr<uint8_t[]> buf;
-	try
-	{
-		buf = std::make_unique<uint8_t[]>(bytes_per_image);
-	}
-	catch (const std::bad_alloc &e)
-	{
-		ASTCENC_UNUSED(e);
-		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
-		return nullptr;
-	}
+	texture->mip_count = mip_count;
+	texture->array_count = array_count;
+	texture->face_count = face_count;
+	texture->is_hdr = bitness >= 16;
+	texture->format.components = components;
 
-	file.read(reinterpret_cast<char*>(buf.get()), bytes_per_image);
-	if (file.fail())
+	for (unsigned int mip = 0; mip < mip_count; mip++)
 	{
-		print_error("ERROR: File read failed '%s'\n", filename);
-		return nullptr;
-	}
+		size_t dim_x = mip_level_dim(base_x, mip);
+		size_t dim_y = mip_level_dim(base_y, mip);
+		size_t dim_z = is_3d ? mip_level_dim(base_z, mip) : 1;
 
-	// Transfer data from the surface to our own image data structure
-	astcenc_image_ptr astc_img;
-	try
-	{
-		astc_img = alloc_image(bitness, dim_x, dim_y, dim_z);
-	}
-	catch (const std::bad_alloc &e)
-	{
-		ASTCENC_UNUSED(e);
-		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
-		return nullptr;
-	}
+		bool overflow { false };
+		size_t bytes_per_row = astc::mul_safe(bytes_per_pixel, dim_x, overflow);
+		size_t bytes_per_plane = astc::mul_safe(bytes_per_row, dim_y, overflow);
+		size_t bytes_per_subimage = astc::mul_safe(bytes_per_plane, dim_z, overflow);
 
-	if (!astc_img)
-	{
-		print_error("ERROR: Image memory size overflow\n");
-		return nullptr;
-	}
+		unsigned int level_array_count = is_3d ? 1u : array_count;
+		unsigned int level_face_count = is_3d ? 1u : face_count;
+		size_t level_subimages = astc::mul_safe(level_array_count, level_face_count, overflow);
+		size_t bytes_per_mip = astc::mul_safe(bytes_per_subimage, level_subimages, overflow);
 
-	for (size_t z = 0; z < dim_z; z++)
-	{
-		for (size_t y = 0; y < dim_y; y++)
+		// Verify that our output plane allocation does not overflow because this always uses 4
+		// components which can be more than the input file used
+		size_t plane_texels = astc::mul_safe(dim_x, dim_y, overflow);
+		astc::mul_safe(plane_texels, 4, overflow);
+
+		if (overflow)
 		{
-			size_t mod_y = y_flip ? dim_y - y - 1 : y;
-			void* dst;
+			print_error("ERROR: Image header corrupt '%s'\n", filename);
+			return nullptr;
+		}
 
-			if (astc_img->data_type == ASTCENC_TYPE_U8)
-			{
-				uint8_t* data8 = static_cast<uint8_t*>(astc_img->data[z]);
-				dst = static_cast<void*>(&data8[4 * dim_x * mod_y]);
-			}
-			else  // if (astc_img->data_type == ASTCENC_TYPE_F16)
-			{
-				assert(astc_img->data_type == ASTCENC_TYPE_F16);
-				uint16_t* data16 = static_cast<uint16_t*>(astc_img->data[z]);
-				dst = static_cast<void*>(&data16[4 * dim_x * mod_y]);
-			}
+		std::unique_ptr<uint8_t[]> buf;
+		try
+		{
+			buf = std::make_unique<uint8_t[]>(bytes_per_mip);
+		}
+		catch (const std::bad_alloc &e)
+		{
+			ASTCENC_UNUSED(e);
+			print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+			return nullptr;
+		}
 
-			uint8_t *src = buf.get() + (z * bytes_per_plane) + (y * bytes_per_row);
-			copy_scanline(dst, src, dim_x, copy_method);
+		file.read(reinterpret_cast<char*>(buf.get()), bytes_per_mip);
+		if (file.fail())
+		{
+			print_error("ERROR: File read failed '%s'\n", filename);
+			return nullptr;
+		}
+
+		for (unsigned int layer = 0; layer < level_array_count; layer++)
+		{
+			for (unsigned int face = 0; face < level_face_count; face++)
+			{
+				size_t sub_index = (static_cast<size_t>(layer) * level_face_count) + face;
+				const uint8_t* sub_src = buf.get() + (sub_index * bytes_per_subimage);
+
+				astcenc_image_ptr astc_img;
+				try
+				{
+					astc_img = alloc_image(bitness, dim_x, dim_y, dim_z);
+				}
+				catch (const std::bad_alloc &e)
+				{
+					ASTCENC_UNUSED(e);
+					print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+					return nullptr;
+				}
+
+				if (!astc_img)
+				{
+					print_error("ERROR: Image memory size overflow\n");
+					return nullptr;
+				}
+
+				for (size_t z = 0; z < dim_z; z++)
+				{
+					for (size_t y = 0; y < dim_y; y++)
+					{
+						size_t mod_y = y_flip ? dim_y - y - 1 : y;
+						void* dst;
+
+						if (astc_img->data_type == ASTCENC_TYPE_U8)
+						{
+							uint8_t* data8 = static_cast<uint8_t*>(astc_img->data[z]);
+							dst = static_cast<void*>(&data8[4 * dim_x * mod_y]);
+						}
+						else  // if (astc_img->data_type == ASTCENC_TYPE_F16)
+						{
+							assert(astc_img->data_type == ASTCENC_TYPE_F16);
+							uint16_t* data16 = static_cast<uint16_t*>(astc_img->data[z]);
+							dst = static_cast<void*>(&data16[4 * dim_x * mod_y]);
+						}
+
+						const uint8_t* src = sub_src + (z * bytes_per_plane) + (y * bytes_per_row);
+						copy_scanline(dst, src, dim_x, copy_method);
+					}
+				}
+
+				texture->images.push_back(std::move(astc_img));
+			}
 		}
 	}
 
 	is_hdr = bitness >= 16;
 	component_count = components;
-	return astc_img;
+	return texture;
+}
+
+/**
+ * @brief Load an uncompressed DDS image using the local custom loader.
+ *
+ * Backwards-compatible wrapper returning only the first sub-image.
+ *
+ * @param      filename          The name of the file to load.
+ * @param      y_flip            Should the image be vertically flipped?
+ * @param[out] is_hdr            Is this an HDR image load?
+ * @param[out] component_count   The number of components in the data.
+ *
+ * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
+ */
+static astcenc_image_ptr load_dds_uncompressed_image(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count
+) {
+	auto texture = load_dds_uncompressed_texture(filename, y_flip, is_hdr, component_count);
+	if (!texture || texture->images.empty())
+	{
+		return nullptr;
+	}
+
+	return std::move(texture->images[0]);
 }
 
 /**
@@ -2617,6 +3407,100 @@ bool store_ncimage(
 	}
 
 	return storer(output_image, filename, y_flip);
+}
+
+/* See header for documentation. */
+std::unique_ptr<astcenc_texture> load_nctexture(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count
+) {
+	const char* eptr = strrchr(filename, '.');
+	if (!eptr)
+	{
+		eptr = filename;
+	}
+
+	try
+	{
+		if ((strcmp(eptr, ".ktx") == 0) || (strcmp(eptr, ".KTX") == 0))
+		{
+			return load_ktx_uncompressed_texture(filename, y_flip, is_hdr, component_count);
+		}
+
+		if ((strcmp(eptr, ".dds") == 0) || (strcmp(eptr, ".DDS") == 0))
+		{
+			return load_dds_uncompressed_texture(filename, y_flip, is_hdr, component_count);
+		}
+
+		// Simple 2D image formats only hold a single image; wrap the existing loader result
+		auto image = load_ncimage(filename, y_flip, is_hdr, component_count);
+		if (!image)
+		{
+			return nullptr;
+		}
+
+		auto texture = std::make_unique<astcenc_texture>();
+		texture->type = image->dim_z > 1 ? texture_type::TEX_3D : texture_type::TEX_2D;
+		texture->is_hdr = is_hdr;
+		texture->mip_count = 1;
+		texture->array_count = 1;
+		texture->face_count = 1;
+		texture->format.components = component_count;
+		texture->images.push_back(std::move(image));
+		return texture;
+	}
+	catch (const std::bad_alloc &e)
+	{
+		ASTCENC_UNUSED(e);
+		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+		return nullptr;
+	}
+}
+
+/* See header for documentation. */
+bool store_nctexture(
+	const astcenc_texture* texture,
+	const char* filename,
+	int y_flip
+) {
+	const char* eptr = strrchr(filename, '.');
+	if (!eptr)
+	{
+		eptr = ".ktx";  // Default to KTX when no extension is given
+	}
+
+	bool is_ktx = (strcmp(eptr, ".ktx") == 0) || (strcmp(eptr, ".KTX") == 0);
+	bool is_dds = (strcmp(eptr, ".dds") == 0) || (strcmp(eptr, ".DDS") == 0);
+
+	// Multi-level, array, and cube map resources can only be serialized into a KTX container
+	if (!is_ktx && !is_single_image_texture(texture))
+	{
+		print_error("ERROR: Mipmapped, array, or cube map textures can only be stored as KTX\n");
+		return true;
+	}
+
+	if (is_ktx)
+	{
+		return store_ktx_uncompressed_texture(texture, filename, y_flip);
+	}
+
+	if (is_dds)
+	{
+		return store_dds_uncompressed_image(texture->images.front().get(), filename, y_flip);
+	}
+
+	// Simple 2D image formats fall back to the single-image storer; a 3D texture cannot be
+	// represented and is rejected explicitly
+	const astcenc_image* image = texture->images.front().get();
+	if (image->dim_z > 1)
+	{
+		print_error("ERROR: 3D textures can only be stored as KTX or DDS\n");
+		return true;
+	}
+
+	return store_ncimage(image, filename, y_flip);
 }
 
 /* ============================================================================

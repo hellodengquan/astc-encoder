@@ -1725,6 +1725,235 @@ class CLIPTest(CLITestBase):
         image2_rmse: float = sum(self.get_channel_rmse(input_path, image2_dec))
         self.assertEqual(image1_rmse, image2_rmse)
 
+    # ------------------------------------------------------------------
+    # Full GPU texture resource handling (mip chains, arrays, cube maps)
+    # ------------------------------------------------------------------
+
+    # KTX1 constants used by the fixture builders and header parser
+    KTX_MAGIC = b'\xabKTX 11\xbb\r\n\x1a\n'
+    GL_UNSIGNED_BYTE = 0x1401
+    GL_RGBA = 0x1908
+    GL_RGBA8 = 0x8058
+    GL_ASTC_RGBA_4x4 = 0x93B0
+    GL_ASTC_RGBA_4x4x4 = 0x93C3
+
+    def make_uncompressed_ktx(
+        self, width: int, height: int, depth: int, mips: int,
+            array_count: int, faces: int) -> Path:
+        '''
+        Build an uncompressed RGBA8 KTX1 fixture.
+
+        Every sub-image is a unique solid color encoding its mip, layer, and face indices, so a
+        lost or aliased sub-resource is detectable after a round trip.
+
+        Args:
+            width: Base level width in texels.
+            height: Base level height in texels.
+            depth: Base level depth; one for 2D resources.
+            mips: Number of mipmap levels.
+            array_count: Number of array layers; one for non-array resources.
+            faces: Six for a cube map, otherwise one.
+
+        Return:
+            The path of the generated fixture.
+        '''
+        path = self.get_tmp_image_path('EXP', '.ktx')
+        is_3d = depth > 1
+        header = self.KTX_MAGIC + struct.pack(
+            '<13I',
+            0x04030201, self.GL_UNSIGNED_BYTE, 1, self.GL_RGBA, self.GL_RGBA8,
+            self.GL_RGBA, width, height, depth if is_3d else 0,
+            array_count if array_count > 1 else 0, faces, mips, 0)
+
+        with open(path, 'wb') as handle:
+            handle.write(header)
+            for mip in range(mips):
+                mw = max(width >> mip, 1)
+                mh = max(height >> mip, 1)
+                md = max(depth >> mip, 1) if is_3d else 1
+                layers = 1 if is_3d else array_count
+                level_faces = 1 if is_3d else faces
+                chunks = []
+                for layer in range(layers):
+                    for face in range(level_faces):
+                        red = 10 + 7 * face + 3 * layer + mip
+                        green = 20 + 11 * layer + 2 * mip
+                        blue = 30 + 5 * face + 13 * mip
+                        pixels = numpy.zeros((md, mh, mw, 4), dtype=numpy.uint8)
+                        pixels[..., 0] = min(red, 250)
+                        pixels[..., 1] = min(green, 250)
+                        pixels[..., 2] = min(blue, 250)
+                        pixels[..., 3] = 255
+                        chunks.append(pixels.tobytes())
+                payload = b''.join(chunks)
+                handle.write(struct.pack('<I', len(payload)))
+                handle.write(payload)
+                handle.write(b'\x00' * ((-len(payload)) & 3))
+
+        return path
+
+    @staticmethod
+    def parse_ktx_header(path: Path) -> dict[str, int]:
+        '''
+        Parse the 64-byte KTX1 header into named fields.
+
+        Args:
+            path: The KTX file to read.
+
+        Return:
+            A dictionary of the header fields keyed by their KTX names.
+        '''
+        with open(path, 'rb') as handle:
+            raw = handle.read(64)
+        assert raw[:12] == CLIPTest.KTX_MAGIC
+        values = struct.unpack('<13I', raw[12:])
+        return dict(zip(
+            ['endianness', 'gl_type', 'gl_type_size', 'gl_format', 'gl_internal',
+             'gl_base', 'width', 'height', 'depth', 'array_count', 'faces',
+             'mips', 'kv'], values))
+
+    def parse_ktx_level_sizes(self, path: Path) -> list[int]:
+        '''
+        Read the byte size stored for every KTX1 mip level.
+
+        Args:
+            path: The KTX file to read.
+
+        Return:
+            The declared payload size of each level.
+        '''
+        with open(path, 'rb') as handle:
+            raw = handle.read()
+        header = self.parse_ktx_header(path)
+        offset = 64 + header['kv']
+        sizes = []
+        for _ in range(max(header['mips'], 1)):
+            (size,) = struct.unpack('<I', raw[offset:offset + 4])
+            offset += 4 + size + ((-size) & 3)
+            sizes.append(size)
+        return sizes
+
+    def assert_texture_layout(
+        self, path: Path, width: int, height: int, depth: int,
+            mips: int, array_count: int, faces: int) -> None:
+        '''
+        Assert a KTX file preserves the requested resource topology.
+
+        Args:
+            path: The KTX file to inspect.
+            width: Expected base width.
+            height: Expected base height.
+            depth: Expected base depth; zero for 2D resources.
+            mips: Expected mip level count.
+            array_count: Expected array layer count; zero for non-arrays.
+            faces: Expected face count.
+        '''
+        header = self.parse_ktx_header(path)
+        self.assertEqual(header['width'], width)
+        self.assertEqual(header['height'], height)
+        self.assertEqual(header['depth'], depth)
+        self.assertEqual(header['array_count'], array_count)
+        self.assertEqual(header['faces'], faces)
+        self.assertEqual(header['mips'], mips)
+
+    def test_texture_mip_chain_roundtrip(self) -> None:
+        '''
+        A mipmapped 2D texture keeps every level through compress and decompress.
+        '''
+        source = self.make_uncompressed_ktx(8, 8, 1, 4, 1, 1)
+        compressed = self.get_tmp_image_path('EXP', '.ktx')
+        decompressed = self.get_tmp_image_path('EXP', '.ktx')
+
+        self.exec([self.binary, '-cl', source, compressed, '4x4', '-fastest', '-j', '1'])
+        self.exec([self.binary, '-dl', compressed, decompressed, '-j', '1'])
+
+        # 8x8 base is four 4x4 blocks; each subsequent level is one block
+        self.assertEqual(self.parse_ktx_level_sizes(compressed), [64, 16, 16, 16])
+        self.assert_texture_layout(compressed, 8, 8, 0, 4, 0, 1)
+        self.assert_texture_layout(decompressed, 8, 8, 0, 4, 0, 1)
+
+    def test_texture_cubemap_roundtrip(self) -> None:
+        '''
+        A cube map retains all six faces across both mip levels.
+        '''
+        source = self.make_uncompressed_ktx(4, 4, 1, 2, 1, 6)
+        compressed = self.get_tmp_image_path('EXP', '.ktx')
+        decompressed = self.get_tmp_image_path('EXP', '.ktx')
+
+        self.exec([self.binary, '-cl', source, compressed, '4x4', '-fastest', '-j', '1'])
+        self.exec([self.binary, '-dl', compressed, decompressed, '-j', '1'])
+
+        # Six faces per level, each a single 16-byte block
+        self.assertEqual(self.parse_ktx_level_sizes(compressed), [6 * 16, 6 * 16])
+        self.assert_texture_layout(compressed, 4, 4, 0, 2, 0, 6)
+        self.assert_texture_layout(decompressed, 4, 4, 0, 2, 0, 6)
+
+    def test_texture_array_roundtrip(self) -> None:
+        '''
+        A 2D texture array retains every layer.
+        '''
+        source = self.make_uncompressed_ktx(4, 4, 1, 2, 3, 1)
+        compressed = self.get_tmp_image_path('EXP', '.ktx')
+        decompressed = self.get_tmp_image_path('EXP', '.ktx')
+
+        self.exec([self.binary, '-cl', source, compressed, '4x4', '-fastest', '-j', '1'])
+        self.exec([self.binary, '-dl', compressed, decompressed, '-j', '1'])
+
+        # Three layers per level, each a single 16-byte block
+        self.assertEqual(self.parse_ktx_level_sizes(compressed), [3 * 16, 3 * 16])
+        self.assert_texture_layout(compressed, 4, 4, 0, 2, 3, 1)
+        self.assert_texture_layout(decompressed, 4, 4, 0, 2, 3, 1)
+
+    def test_texture_cubemap_array_roundtrip(self) -> None:
+        '''
+        A cube map array retains two cube maps, twelve faces in total.
+        '''
+        source = self.make_uncompressed_ktx(4, 4, 1, 1, 2, 6)
+        compressed = self.get_tmp_image_path('EXP', '.ktx')
+        decompressed = self.get_tmp_image_path('EXP', '.ktx')
+
+        self.exec([self.binary, '-cl', source, compressed, '4x4', '-fastest', '-j', '1'])
+        self.exec([self.binary, '-dl', compressed, decompressed, '-j', '1'])
+
+        # Two cube maps of six faces, each face one 16-byte block
+        self.assertEqual(self.parse_ktx_level_sizes(compressed), [2 * 6 * 16])
+        self.assert_texture_layout(compressed, 4, 4, 0, 1, 2, 6)
+        self.assert_texture_layout(decompressed, 4, 4, 0, 1, 2, 6)
+
+    def test_texture_3d_mip_depth_shrinks(self) -> None:
+        '''
+        A 3D texture shrinks in depth at each mip level and round-trips the layout.
+        '''
+        source = self.make_uncompressed_ktx(8, 8, 4, 3, 1, 1)
+        compressed = self.get_tmp_image_path('EXP', '.ktx')
+        decompressed = self.get_tmp_image_path('EXP', '.ktx')
+
+        self.exec([self.binary, '-cl', source, compressed, '4x4x4', '-fastest', '-j', '1'])
+        self.exec([self.binary, '-dl', compressed, decompressed, '-j', '1'])
+
+        header = self.parse_ktx_header(compressed)
+        self.assertEqual(header['depth'], 4)
+        self.assertEqual(header['mips'], 3)
+        self.assertEqual(header['gl_internal'], self.GL_ASTC_RGBA_4x4x4)
+
+        # Level block counts: 2*2*1, 1*1*1, 1*1*1 blocks of 16 bytes
+        self.assertEqual(self.parse_ktx_level_sizes(compressed), [64, 16, 16])
+        self.assert_texture_layout(decompressed, 8, 8, 4, 3, 0, 1)
+
+    def test_texture_astc_output_rejects_multi_resource(self) -> None:
+        '''
+        The single-image .astc container cannot hold a cube map or mip chain.
+        '''
+        for faces, mips in ((6, 1), (1, 2)):
+            with self.subTest(faces=faces, mips=mips):
+                source = self.make_uncompressed_ktx(4, 4, 1, mips, 1, faces)
+                output = self.get_tmp_image_path('EXP', '.astc')
+                cmd = [self.binary, '-cl', source, output, '4x4', '-fastest', '-j', '1']
+                result = sp.run([str(x) for x in cmd], capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('only be stored as KTX', result.stderr)
+                self.assertFalse(output.exists())
+
 
 class CLINTest(CLITestBase):
     '''

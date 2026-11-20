@@ -65,6 +65,48 @@ struct astc_compressed_image
 };
 
 /**
+ * @brief The class of a GPU texture resource.
+ */
+enum class texture_type
+{
+	/** @brief A 2D texture, or a flat 3D texture with a single level and face. */
+	TEX_2D,
+	/** @brief A 3D volumetric texture; mip levels shrink in depth. */
+	TEX_3D,
+	/** @brief A cube map with six square faces. */
+	TEX_CUBE,
+	/** @brief An array of independent 2D layers. */
+	TEX_2D_ARRAY,
+	/** @brief An array of independent cube maps. */
+	TEX_CUBE_ARRAY
+};
+
+/**
+ * @brief The on-disk pixel format of an uncompressed container texture.
+ *
+ * These values mirror the KTX GL type/format pairings and the DDS DXGI formats that the local
+ * loaders can read. Storing them alongside the canonical RGBA pixel data lets a KTX output keep
+ * the exact component layout of the source file.
+ */
+struct source_pixel_format
+{
+	/** @brief The KTX gl_type field (GL_UNSIGNED_BYTE, GL_HALF_FLOAT, ...). */
+	uint32_t gl_type { 0 };
+
+	/** @brief The KTX gl_type_size field. */
+	uint32_t gl_type_size { 1 };
+
+	/** @brief The KTX gl_format field. */
+	uint32_t gl_format { 0 };
+
+	/** @brief The KTX gl_internal_format field. */
+	uint32_t gl_internal_format { 0 };
+
+	/** @brief The number of active color components in the source file. */
+	unsigned int components { 4 };
+};
+
+/**
  * @brief Config options that have been read from command line.
  */
 struct cli_config_options
@@ -156,6 +198,181 @@ struct astcenc_image_deleter
  * @brief A smart pointer wrapper around an astcenc_image.
  */
 using astcenc_image_ptr = std::unique_ptr<astcenc_image, astcenc_image_deleter>;
+
+/**
+ * @brief A full uncompressed GPU texture resource.
+ *
+ * A texture is a collection of independent 2D or 3D sub-images, one per mip level / array layer /
+ * cube face combination. Each sub-image is stored in the canonical 4 component RGBA layout used by
+ * the core codec. The ordering of the flat @c images vector is:
+ *
+ *     for each mip level, for each array layer, for each cube face
+ *
+ * matching the on-disk KTX layout.
+ */
+struct astcenc_texture
+{
+	/** @brief The texture class. */
+	texture_type type { texture_type::TEX_2D };
+
+	/** @brief @c true if the pixel data is HDR, @c false for LDR. */
+	bool is_hdr { false };
+
+	/** @brief The number of mipmap levels; always at least one. */
+	unsigned int mip_count { 1 };
+
+	/** @brief The number of array layers; always one for non-arrays. */
+	unsigned int array_count { 1 };
+
+	/** @brief The number of cube faces; six for cube maps, otherwise one. */
+	unsigned int face_count { 1 };
+
+	/** @brief The source container pixel format, used to round-trip KTX outputs. */
+	source_pixel_format format;
+
+	/** @brief The sub-images, indexed by mip, then layer, then face. */
+	std::vector<astcenc_image_ptr> images;
+
+	/**
+	 * @brief Get the sub-image for a given mip level, array layer, and face.
+	 *
+	 * @param mip    The mip level index.
+	 * @param layer  The array layer index.
+	 * @param face   The cube face index.
+	 *
+	 * @return The sub-image.
+	 */
+	astcenc_image* get_image(
+		unsigned int mip,
+		unsigned int layer,
+		unsigned int face) const
+	{
+		size_t index = (((static_cast<size_t>(mip) * array_count) + layer) * face_count) + face;
+		return images[index].get();
+	}
+};
+
+/**
+ * @brief A full compressed GPU texture resource.
+ *
+ * Each sub-image is an independently compressed ASTC payload, stored in the same mip / layer /
+ * face ordering as @c astcenc_texture.
+ */
+struct astc_compressed_texture
+{
+	/** @brief The texture class. */
+	texture_type type { texture_type::TEX_2D };
+
+	/** @brief @c true if the pixel data uses an sRGB transfer function. */
+	bool is_srgb { false };
+
+	/** @brief The number of mipmap levels; always at least one. */
+	unsigned int mip_count { 1 };
+
+	/** @brief The number of array layers; always one for non-arrays. */
+	unsigned int array_count { 1 };
+
+	/** @brief The number of cube faces; six for cube maps, otherwise one. */
+	unsigned int face_count { 1 };
+
+	/** @brief The compressed sub-images, indexed by mip, then layer, then face. */
+	std::vector<astc_compressed_image> images;
+
+	/**
+	 * @brief Get the sub-image for a given mip level, array layer, and face.
+	 *
+	 * @param mip    The mip level index.
+	 * @param layer  The array layer index.
+	 * @param face   The cube face index.
+	 *
+	 * @return The compressed sub-image.
+	 */
+	astc_compressed_image& get_image(
+		unsigned int mip,
+		unsigned int layer,
+		unsigned int face)
+	{
+		size_t index = (((static_cast<size_t>(mip) * array_count) + layer) * face_count) + face;
+		return images[index];
+	}
+
+	/** @overload */
+	const astc_compressed_image& get_image(
+		unsigned int mip,
+		unsigned int layer,
+		unsigned int face) const
+	{
+		size_t index = (((static_cast<size_t>(mip) * array_count) + layer) * face_count) + face;
+		return images[index];
+	}
+};
+
+/**
+ * @brief Load a full uncompressed texture from a container file.
+ *
+ * Unlike @c load_ncimage, which flattens a container down to the first mip level and sub-image,
+ * this preserves the full GPU resource layout: every mip level, array layer, and cube face is
+ * loaded as an independent sub-image.
+ *
+ * @param      filename          The file path on disk.
+ * @param      y_flip            Should this image be Y flipped?
+ * @param[out] is_hdr            Is the loaded image HDR?
+ * @param[out] component_count   The number of components in the loaded image.
+ *
+ * @return The loaded texture, or @c nullptr on error.
+ */
+std::unique_ptr<astcenc_texture> load_nctexture(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count);
+
+/**
+ * @brief Store a full uncompressed texture to a container file.
+ *
+ * Only KTX output can hold multi-level, array, or cube map textures. A single 2D or 3D image with
+ * one level is also accepted by the single-image storers.
+ *
+ * @param texture    The source texture data.
+ * @param filename   The name of the file to save.
+ * @param y_flip     Should the image be vertically flipped?
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool store_nctexture(
+	const astcenc_texture* texture,
+	const char* filename,
+	int y_flip);
+
+/**
+ * @brief Check if a texture contains a single sub-image with no extra mip levels.
+ *
+ * @param texture   The texture to query.
+ *
+ * @return @c true if the texture is a single 2D or 3D image, @c false otherwise.
+ */
+static inline bool is_single_image_texture(
+	const astcenc_texture* texture)
+{
+	return (texture->mip_count == 1) &&
+	       (texture->array_count == 1) &&
+	       (texture->face_count == 1);
+}
+
+/**
+ * @brief Check if a compressed texture contains a single sub-image with no extra mip levels.
+ *
+ * @param texture   The texture to query.
+ *
+ * @return @c true if the texture is a single 2D or 3D image, @c false otherwise.
+ */
+static inline bool is_single_image_compressed_texture(
+	const astc_compressed_texture* texture)
+{
+	return (texture->mip_count == 1) &&
+	       (texture->array_count == 1) &&
+	       (texture->face_count == 1);
+}
 
 /**
  * @brief Load uncompressed image.
@@ -308,6 +525,33 @@ bool store_ktx_compressed_image(
 	const astc_compressed_image& img,
 	const char* filename,
 	bool is_srgb);
+
+/**
+ * @brief Load a full compressed .ktx texture resource.
+ *
+ * All mip levels, array layers, and cube faces in the file are loaded as independent compressed
+ * sub-images, preserving the source texture layout.
+ *
+ * @param      filename   The file to load.
+ * @param[out] texture    The output texture to populate.
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool load_ktx_compressed_texture(
+	const char* filename,
+	astc_compressed_texture& texture);
+
+/**
+ * @brief Store a full compressed .ktx texture resource.
+ *
+ * @param texture    The texture data to store.
+ * @param filename   The name of the file to save.
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool store_ktx_compressed_texture(
+	const astc_compressed_texture& texture,
+	const char* filename);
 
 /**
  * @brief Create an image from a 2D float data array.

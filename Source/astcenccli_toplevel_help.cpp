@@ -602,9 +602,12 @@ COMPRESSION FILE FORMATS
     supported:
 
     * Texel format must be R, RG, RGB, BGR, RGBA, BGRA, L, or LA.
-    * Texture topology must be 2D, 2D-array, 3D, or cube-map.
-    * Only the first mipmap level, cube face, or 2D array layer will be
-      read.
+    * Texture topology must be 2D, 2D-array, 3D, cube-map, or cube-map
+      array.
+    * Every mipmap level, cube face, and 2D array layer is processed as
+      an independent sub-image, and the full resource layout is preserved
+      when the output is a KTX file. Single-image outputs, such as .astc
+      or the simple 2D image formats, can only hold one sub-image.
 
     The following formats are supported as compression outputs:
 

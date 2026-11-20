@@ -502,6 +502,107 @@ static void decompression_workload_runner(
 }
 
 /**
+ * @brief Compress one sub-image through the codec.
+ *
+ * A single context processes sub-images serially, resetting its state between them. The output
+ * payload is resized to the number of ASTC blocks needed for the input dimensions.
+ *
+ * @param      context        The codec context, configured with the target block size.
+ * @param      image_in       The uncompressed input sub-image.
+ * @param      swizzle        The encode swizzle.
+ * @param      thread_count   The number of worker threads to use.
+ * @param[out] image_out      The compressed output sub-image.
+ *
+ * @return @c ASTCENC_SUCCESS on success, or an error code on failure.
+ */
+static astcenc_error compress_subimage(
+	astcenc_context* context,
+	const astcenc_image* image_in,
+	const astcenc_swizzle& swizzle,
+	unsigned int thread_count,
+	astc_compressed_image& image_out
+) {
+	size_t blocks_x = astc::get_block_count_safe(image_in->dim_x, image_out.block_x);
+	size_t blocks_y = astc::get_block_count_safe(image_in->dim_y, image_out.block_y);
+	size_t blocks_z = astc::get_block_count_safe(image_in->dim_z, image_out.block_z);
+
+	bool overflow { false };
+	size_t buffer_size = astc::mul_safe(blocks_x, blocks_y, overflow);
+	buffer_size = astc::mul_safe(buffer_size, blocks_z, overflow);
+	buffer_size = astc::mul_safe(buffer_size, 16, overflow);
+	if (overflow)
+	{
+		return ASTCENC_ERR_OUT_OF_MEM;
+	}
+
+	image_out.data.resize(buffer_size);
+	image_out.dim_x = image_in->dim_x;
+	image_out.dim_y = image_in->dim_y;
+	image_out.dim_z = image_in->dim_z;
+
+	compression_workload work;
+	work.context = context;
+	work.image = const_cast<astcenc_image*>(image_in);
+	work.swizzle = swizzle;
+	work.data_out = image_out.data.data();
+	work.data_len = buffer_size;
+	work.error = ASTCENC_SUCCESS;
+
+	if (thread_count > 1)
+	{
+		launch_threads("Compression", thread_count, compression_workload_runner, &work);
+	}
+	else
+	{
+		work.error = astcenc_compress_image(
+		    work.context, work.image, &work.swizzle, work.data_out, work.data_len, 0);
+	}
+
+	astcenc_compress_reset(context);
+	return work.error;
+}
+
+/**
+ * @brief Decompress one sub-image through the codec.
+ *
+ * @param      context        The codec context.
+ * @param      image_in       The compressed input sub-image.
+ * @param      swizzle        The decode swizzle.
+ * @param      thread_count   The number of worker threads to use.
+ * @param[out] image_out      The uncompressed output sub-image.
+ *
+ * @return The worst error reported by any worker, or @c ASTCENC_SUCCESS on success.
+ */
+static astcenc_error decompress_subimage(
+	astcenc_context* context,
+	const astc_compressed_image& image_in,
+	const astcenc_swizzle& swizzle,
+	unsigned int thread_count,
+	astcenc_image* image_out
+) {
+	decompression_workload work;
+	work.context = context;
+	work.data = const_cast<uint8_t*>(image_in.data.data());
+	work.data_len = image_in.data.size();
+	work.image_out = image_out;
+	work.swizzle = swizzle;
+	work.error = ASTCENC_SUCCESS;
+
+	if (thread_count > 1)
+	{
+		launch_threads("Decompression", thread_count, decompression_workload_runner, &work);
+	}
+	else
+	{
+		work.error = astcenc_decompress_image(
+		    work.context, work.data, work.data_len, work.image_out, &work.swizzle, 0);
+	}
+
+	astcenc_decompress_reset(context);
+	return work.error.load();
+}
+
+/**
  * @brief Utility to generate a slice file name from a pattern.
  *
  * Convert "foo/bar.png" into "foo/bar_<slice>.png"
@@ -708,7 +809,7 @@ static bool parse_commandline_options(
  * @param[in]  argv         Command line argument vector.
  * @param      profile      Codec color profile.
  * @param      operation    Codec operation mode.
- * @param      comp_image   Compressed image if a decompress operation.
+ * @param      comp_tex     Compressed texture if a decompress operation, else @c nullptr.
  * @param[out] preprocess   Image preprocess operation.
  * @param[out] config       Codec configuration.
  *
@@ -719,7 +820,7 @@ static bool init_astcenc_config(
 	char **argv,
 	astcenc_profile profile,
 	astcenc_operation operation,
-	astc_compressed_image& comp_image,
+	const astc_compressed_texture* comp_tex,
 	astcenc_preprocess& preprocess,
 	astcenc_config& config
 ) {
@@ -730,9 +831,11 @@ static bool init_astcenc_config(
 	// For decode the block size is set by the incoming image
 	if (operation == ASTCENC_OP_DECOMPRESS)
 	{
-		block_x = comp_image.block_x;
-		block_y = comp_image.block_y;
-		block_z = comp_image.block_z;
+		assert(comp_tex && !comp_tex->images.empty());
+		const astc_compressed_image& first = comp_tex->images.front();
+		block_x = first.block_x;
+		block_y = first.block_y;
+		block_z = first.block_z;
 	}
 
 	float quality = 0.0f;
@@ -2586,32 +2689,39 @@ int astcenc_main(
 	// Load the compressed input file if needed
 
 	// This has to come first, as the block size is in the file header
-	astc_compressed_image image_comp {};
+	astc_compressed_texture texture_comp {};
 	if (operation & ASTCENC_STAGE_LD_COMP)
 	{
 		if (ends_with(input_filename, ".astc"))
 		{
-			error = load_cimage(input_filename.c_str(), image_comp);
-			if (error)
-			{
-				return 1;
-			}
-		}
-		else if (ends_with(input_filename, ".ktx"))
-		{
-			bool is_srgb;
-			error = load_ktx_compressed_image(input_filename.c_str(), is_srgb, image_comp);
+			// The .astc container can only hold a single 2D or 3D image
+			astc_compressed_image single;
+			error = load_cimage(input_filename.c_str(), single);
 			if (error)
 			{
 				return 1;
 			}
 
-			if (is_srgb && (profile != ASTCENC_PRF_LDR_SRGB))
+			texture_comp.type = single.dim_z > 1 ? texture_type::TEX_3D : texture_type::TEX_2D;
+			texture_comp.mip_count = 1;
+			texture_comp.array_count = 1;
+			texture_comp.face_count = 1;
+			texture_comp.images.push_back(std::move(single));
+		}
+		else if (ends_with(input_filename, ".ktx"))
+		{
+			error = load_ktx_compressed_texture(input_filename.c_str(), texture_comp);
+			if (error)
+			{
+				return 1;
+			}
+
+			if (texture_comp.is_srgb && (profile != ASTCENC_PRF_LDR_SRGB))
 			{
 				printf("WARNING: Input file is sRGB, but decompressing as linear\n");
 			}
 
-			if (!is_srgb && (profile == ASTCENC_PRF_LDR_SRGB))
+			if (!texture_comp.is_srgb && (profile == ASTCENC_PRF_LDR_SRGB))
 			{
 				printf("WARNING: Input file is linear, but decompressing as sRGB\n");
 			}
@@ -2625,7 +2735,9 @@ int astcenc_main(
 
 	astcenc_config config {};
 	astcenc_preprocess preprocess;
-	error = init_astcenc_config(argc, argv, profile, operation, image_comp, preprocess, config);
+	const astc_compressed_texture* comp_tex_ptr =
+	    (operation & ASTCENC_STAGE_LD_COMP) ? &texture_comp : nullptr;
+	error = init_astcenc_config(argc, argv, profile, operation, comp_tex_ptr, preprocess, config);
 	if (error)
 	{
 		return 1;
@@ -2670,13 +2782,23 @@ int astcenc_main(
 		config.progress_callback = progress_emitter;
 	}
 
+	// Full uncompressed input texture, populated for compress and test operations
+	std::unique_ptr<astcenc_texture> texture_uncomp_in;
+
+	// A single-image view used by crop, preprocess, and metrics paths
 	astcenc_image_ptr image_uncomp_in_storage;
 	astcenc_image* image_uncomp_in = nullptr;
 	astcenc_image image_crop {};
 	std::vector<void*> crop_slices;
 	unsigned int image_uncomp_in_component_count = 0;
 	bool image_uncomp_in_is_hdr = false;
-	astcenc_image_ptr image_decomp_out;
+	// Keeps the original allocation alive while image_crop holds borrowed slice pointers
+	astcenc_image_ptr image_crop_source_holder;
+	// Non-null when compression must read the borrowed crop view instead of the stored sub-image
+	astcenc_image* image_crop_override = nullptr;
+
+	// Full decompressed output texture, populated for decompress and test operations
+	std::unique_ptr<astcenc_texture> texture_decomp_out;
 
 	astcenc_error codec_status;
 	astcenc_context_ptr codec_context;
@@ -2716,25 +2838,68 @@ int astcenc_main(
 	{
 		// A cropped image must be flipped after selecting the region
 		bool is_y_flip_needed = cli_config.y_flip && !cli_config.is_crop_requested;
-		image_uncomp_in_storage = load_uncomp_file(
-		    input_filename.c_str(), cli_config.array_size, is_y_flip_needed,
-		    image_uncomp_in_is_hdr, image_uncomp_in_component_count);
-		image_uncomp_in = image_uncomp_in_storage.get();
-		if (!image_uncomp_in)
+
+		// The -zdim slice-file pattern only applies to non-container 2D image sequences; KTX and
+		// DDS carry their own 3D/array layout and are loaded as complete textures
+		const char* ext = strrchr(input_filename.c_str(), '.');
+		bool is_container = ext &&
+		                    ((strcmp(ext, ".ktx") == 0) || (strcmp(ext, ".KTX") == 0) ||
+		                     (strcmp(ext, ".dds") == 0) || (strcmp(ext, ".DDS") == 0));
+
+		if ((cli_config.array_size > 1) && !is_container)
 		{
-			print_error("ERROR: Failed to load uncompressed image file\n");
-			return 1;
+			// Legacy path: assemble a 3D image from a sequence of named 2D slice files
+			image_uncomp_in_storage = load_uncomp_file(
+			    input_filename.c_str(), cli_config.array_size, is_y_flip_needed,
+			    image_uncomp_in_is_hdr, image_uncomp_in_component_count);
+			if (!image_uncomp_in_storage)
+			{
+				print_error("ERROR: Failed to load uncompressed image file\n");
+				return 1;
+			}
+
+			texture_uncomp_in = std::make_unique<astcenc_texture>();
+			texture_uncomp_in->type = image_uncomp_in_storage->dim_z > 1
+			                          ? texture_type::TEX_3D : texture_type::TEX_2D;
+			texture_uncomp_in->is_hdr = image_uncomp_in_is_hdr;
+			texture_uncomp_in->format.components = image_uncomp_in_component_count;
+			texture_uncomp_in->images.push_back(std::move(image_uncomp_in_storage));
+		}
+		else
+		{
+			texture_uncomp_in = load_nctexture(
+			    input_filename.c_str(), is_y_flip_needed,
+			    image_uncomp_in_is_hdr, image_uncomp_in_component_count);
+			if (!texture_uncomp_in || texture_uncomp_in->images.empty())
+			{
+				print_error("ERROR: Failed to load uncompressed image file\n");
+				return 1;
+			}
+		}
+
+		// Crop and preprocess only support a single-image texture
+		if (cli_config.is_crop_requested || (preprocess != ASTCENC_PP_NONE))
+		{
+			if (!is_single_image_texture(texture_uncomp_in.get()))
+			{
+				print_error("ERROR: Crop and preprocess are only supported for single-image textures\n");
+				return 1;
+			}
 		}
 
 		if (cli_config.is_crop_requested)
 		{
-			error = image_crop_view(*image_uncomp_in, cli_config, crop_slices, image_crop);
+			error = image_crop_view(*texture_uncomp_in->images.front(), cli_config,
+			                        crop_slices, image_crop);
 			if (error)
 			{
 				return 1;
 			}
 
-			image_uncomp_in = &image_crop;
+			// The crop view borrows slice pointers from the original sub-image; move that
+			// allocation into a holder so it stays alive for the lifetime of the borrowed view
+			image_crop_source_holder = std::move(texture_uncomp_in->images[0]);
+
 			if (cli_config.y_flip)
 			{
 				unsigned int bitness = 32;
@@ -2766,13 +2931,24 @@ int astcenc_main(
 					}
 				}
 
-				image_uncomp_in_storage = std::move(image_flipped);
-				image_uncomp_in = image_uncomp_in_storage.get();
+				// The flipped copy owns its data and becomes the sub-image to compress
+				texture_uncomp_in->images[0] = std::move(image_flipped);
+			}
+			else
+			{
+				// Keep the non-owning stack view; the compress loop references it directly via
+				// image_crop_override rather than wrapping it in an owning smart pointer
+				image_crop_override = &image_crop;
 			}
 		}
 
-		// Check the selected depth so a single cropped plane can use 2D blocks
-		if ((cli_config.array_size > 1) && (config.block_z == 1) && (image_uncomp_in->dim_z > 1))
+		// Check the selected depth so a single cropped plane can use 2D blocks. Use the
+		// effective input view, which may be a crop that reduced the depth to a single plane.
+		astcenc_image* effective_input = image_crop_override
+		                                 ? image_crop_override
+		                                 : texture_uncomp_in->images.front().get();
+		if ((cli_config.array_size > 1) && (config.block_z == 1) &&
+		    (effective_input->dim_z > 1))
 		{
 			print_error("ERROR: -zdim with 3D input data for a 2D output format\n");
 			return 1;
@@ -2780,11 +2956,16 @@ int astcenc_main(
 
 		if (preprocess != ASTCENC_PP_NONE)
 		{
+			// Read from the borrowed crop view when active, otherwise from the stored sub-image
+			astcenc_image* source_img = image_crop_override
+			                            ? image_crop_override
+			                            : texture_uncomp_in->images.front().get();
+
 			// Use float storage to preserve fractional color values during preprocessing
 			auto image_pp = alloc_image(32,
-			                            image_uncomp_in->dim_x,
-			                            image_uncomp_in->dim_y,
-			                            image_uncomp_in->dim_z);
+			                            source_img->dim_x,
+			                            source_img->dim_y,
+			                            source_img->dim_z);
 			if (!image_pp)
 			{
 				print_error("ERROR: Failed to allocate preprocessed image\n");
@@ -2793,18 +2974,24 @@ int astcenc_main(
 
 			if (preprocess == ASTCENC_PP_NORMALIZE)
 			{
-				image_preprocess_normalize(*image_uncomp_in, *image_pp);
+				image_preprocess_normalize(*source_img, *image_pp);
 			}
 
 			if (preprocess == ASTCENC_PP_PREMULTIPLY)
 			{
-				image_preprocess_premultiply(*image_uncomp_in, *image_pp,
-				                             config.profile);
+				image_preprocess_premultiply(*source_img, *image_pp, config.profile);
 			}
 
-			image_uncomp_in_storage = std::move(image_pp);
-			image_uncomp_in = image_uncomp_in_storage.get();
+			// The processed result owns its data, so the borrowed crop view is no longer needed
+			texture_uncomp_in->images[0] = std::move(image_pp);
+			image_crop_override = nullptr;
 		}
+
+		// Expose the first sub-image for the legacy single-image reporting and metrics paths.
+		// A non-flipped crop keeps its borrowed view in the stack image_crop.
+		image_uncomp_in = image_crop_override
+		                  ? image_crop_override
+		                  : texture_uncomp_in->images.front().get();
 
 		if (!cli_config.silentmode)
 		{
@@ -2822,6 +3009,9 @@ int astcenc_main(
 				printf("    Dimensions:                 2D, %zux%zu\n",
 				       image_uncomp_in->dim_x, image_uncomp_in->dim_y);
 			}
+			printf("    Mip levels:                 %u\n", texture_uncomp_in->mip_count);
+			printf("    Array layers:               %u\n", texture_uncomp_in->array_count);
+			printf("    Cube faces:                 %u\n", texture_uncomp_in->face_count);
 			printf("    Components:                 %d\n\n", image_uncomp_in_component_count);
 		}
 	}
@@ -2846,9 +3036,12 @@ int astcenc_main(
 			}
 		}
 
-		// Preserve HDR values until after quality metrics and exposure tone mapping
+		// Preserve HDR values until after quality metrics and exposure tone mapping. Exposure
+		// previews only make sense for a single-image texture.
 		is_ldr_exposure_output = (operation == ASTCENC_OP_TEST) && image_uncomp_in_is_hdr &&
-		                         (out_bitness == 8) && !is_null;
+		                         (out_bitness == 8) && !is_null &&
+		                         texture_uncomp_in &&
+		                         is_single_image_texture(texture_uncomp_in.get());
 		if (is_ldr_exposure_output)
 		{
 			out_bitness = 16;
@@ -2870,54 +3063,14 @@ int astcenc_main(
 	}
 	codec_context.reset(codec_context_raw);
 
+	// Total texel count across every sub-image, used for the throughput metrics
 	double image_size = 0.0;
-	if (image_uncomp_in)
-	{
-		image_size = static_cast<double>(image_uncomp_in->dim_x) *
-		             static_cast<double>(image_uncomp_in->dim_y) *
-		             static_cast<double>(image_uncomp_in->dim_z);
-	}
-	else
-	{
-		image_size = static_cast<double>(image_comp.dim_x) *
-		             static_cast<double>(image_comp.dim_y) *
-		             static_cast<double>(image_comp.dim_z);
-	}
 
-	// Compress an image
+	// Compress a full texture
 	double compression_time = 0.0;
 	if (operation & ASTCENC_STAGE_COMPRESS)
 	{
 		print_astcenc_config(cli_config, config);
-
-		size_t blocks_x = astc::get_block_count_safe(image_uncomp_in->dim_x, config.block_x);
-		size_t blocks_y = astc::get_block_count_safe(image_uncomp_in->dim_y, config.block_y);
-		size_t blocks_z = astc::get_block_count_safe(image_uncomp_in->dim_z, config.block_z);
-
-		bool overflow { false };
-
-		size_t buffer_size = astc::mul_safe(blocks_x, blocks_y, overflow);
-		buffer_size = astc::mul_safe(buffer_size, blocks_z, overflow);
-		buffer_size = astc::mul_safe(buffer_size, 16, overflow);
-		if (overflow)
-		{
-			print_error("ERROR: Image memory size overflow\n");
-			return 1;
-		}
-
-		image_comp.data.resize(buffer_size);
-
-		compression_workload work;
-		work.context = codec_context.get();
-		work.image = image_uncomp_in;
-		work.swizzle = cli_config.swz_encode;
-		work.data_out = image_comp.data.data();
-		work.data_len = buffer_size;
-		work.error = ASTCENC_SUCCESS;
-
-		// Only launch worker threads for multi-threaded use - it makes basic single-threaded
-		// profiling and debugging a little less convoluted
-		double start_compression_time = get_time();
 
 		if (config.progress_callback)
 		{
@@ -2926,19 +3079,47 @@ int astcenc_main(
 			printf("\n");
 		}
 
-		if (cli_config.thread_count > 1)
-		{
-			launch_threads("Compression", cli_config.thread_count,
-			               compression_workload_runner, &work);
-		}
-		else
-		{
-			work.error = astcenc_compress_image(
-			    work.context, work.image, &work.swizzle,
-			    work.data_out, work.data_len, 0);
-		}
+		double start_compression_time = get_time();
 
-		astcenc_compress_reset(codec_context.get());
+		texture_comp.type = texture_uncomp_in->type;
+		texture_comp.is_srgb = profile == ASTCENC_PRF_LDR_SRGB;
+		texture_comp.mip_count = texture_uncomp_in->mip_count;
+		texture_comp.array_count = texture_uncomp_in->array_count;
+		texture_comp.face_count = texture_uncomp_in->face_count;
+		texture_comp.images.clear();
+
+		bool compress_failed = false;
+		for (size_t i = 0; i < texture_uncomp_in->images.size(); i++)
+		{
+			// A non-flipped crop replaces only the first sub-image with its borrowed view
+			const astcenc_image* sub_in =
+			    (image_crop_override && (i == 0))
+			    ? image_crop_override
+			    : texture_uncomp_in->images[i].get();
+
+			astc_compressed_image sub_out;
+			sub_out.block_x = config.block_x;
+			sub_out.block_y = config.block_y;
+			sub_out.block_z = config.block_z;
+
+			astcenc_error sub_status = compress_subimage(
+			    codec_context.get(), sub_in, cli_config.swz_encode,
+			    cli_config.thread_count, sub_out);
+
+			if (sub_status != ASTCENC_SUCCESS)
+			{
+				print_error("ERROR: Codec compress failed: %s\n",
+				            astcenc_get_error_string(sub_status));
+				compress_failed = true;
+				break;
+			}
+
+			image_size += static_cast<double>(sub_in->dim_x) *
+			              static_cast<double>(sub_in->dim_y) *
+			              static_cast<double>(sub_in->dim_z);
+
+			texture_comp.images.push_back(std::move(sub_out));
+		}
 
 		if (config.progress_callback)
 		{
@@ -2947,80 +3128,83 @@ int astcenc_main(
 
 		compression_time = get_time() - start_compression_time;
 
-		if (work.error != ASTCENC_SUCCESS)
+		if (compress_failed)
 		{
-			print_error("ERROR: Codec compress failed: %s\n",
-			            astcenc_get_error_string(work.error));
 			return 1;
 		}
-
-		image_comp.block_x = config.block_x;
-		image_comp.block_y = config.block_y;
-		image_comp.block_z = config.block_z;
-		image_comp.dim_x = image_uncomp_in->dim_x;
-		image_comp.dim_y = image_uncomp_in->dim_y;
-		image_comp.dim_z = image_uncomp_in->dim_z;
 	}
 
-	// Decompress an image
+	// Decompress a full texture
 	double decompression_time = 0.0;
 	bool is_decompression_warning = false;
 	if (operation & ASTCENC_STAGE_DECOMPRESS)
 	{
-		image_decomp_out = alloc_image(
-		    out_bitness, image_comp.dim_x, image_comp.dim_y, image_comp.dim_z);
-		if (!image_decomp_out)
-		{
-			print_error("ERROR: Image memory size overflow\n");
-			return 1;
-		}
-
-		decompression_workload work;
-		work.context = codec_context.get();
-		work.data = image_comp.data.data();
-		work.data_len = image_comp.data.size();
-		work.image_out = image_decomp_out.get();
-		work.swizzle = cli_config.swz_decode;
-		work.error = ASTCENC_SUCCESS;
-
-		// Only launch worker threads for multi-threaded use - it makes basic single-threaded
-		// profiling and debugging a little less convoluted
 		double start_decompression_time = get_time();
 
-		if (cli_config.thread_count > 1)
-		{
-			launch_threads("Decompression", cli_config.thread_count,
-			               decompression_workload_runner, &work);
-		}
-		else
-		{
-			work.error = astcenc_decompress_image(
-			    work.context, work.data, work.data_len,
-			    work.image_out, &work.swizzle, 0);
-		}
+		texture_decomp_out = std::make_unique<astcenc_texture>();
+		texture_decomp_out->type = texture_comp.type;
+		texture_decomp_out->mip_count = texture_comp.mip_count;
+		texture_decomp_out->array_count = texture_comp.array_count;
+		texture_decomp_out->face_count = texture_comp.face_count;
+		texture_decomp_out->is_hdr = (config.profile == ASTCENC_PRF_HDR) ||
+		                             (config.profile == ASTCENC_PRF_HDR_RGB_LDR_A);
+		texture_decomp_out->format = texture_uncomp_in ? texture_uncomp_in->format
+		                                                : source_pixel_format {};
 
-		astcenc_decompress_reset(codec_context.get());
+		bool decompress_failed = false;
+		for (size_t i = 0; i < texture_comp.images.size(); i++)
+		{
+			const astc_compressed_image& sub_in = texture_comp.images[i];
+
+			auto sub_out = alloc_image(out_bitness, sub_in.dim_x, sub_in.dim_y, sub_in.dim_z);
+			if (!sub_out)
+			{
+				print_error("ERROR: Image memory size overflow\n");
+				return 1;
+			}
+
+			astcenc_error sub_status = decompress_subimage(
+			    codec_context.get(), sub_in, cli_config.swz_decode,
+			    cli_config.thread_count, sub_out.get());
+
+			image_size += static_cast<double>(sub_in.dim_x) *
+			              static_cast<double>(sub_in.dim_y) *
+			              static_cast<double>(sub_in.dim_z);
+
+			if (sub_status == ASTCENC_ERR_BAD_BLOCK)
+			{
+				print_error("WARNING: Invalid or unsupported blocks decoded as error colors\n");
+				is_decompression_warning = true;
+			}
+			else if (sub_status != ASTCENC_SUCCESS)
+			{
+				print_error("ERROR: Codec decompress failed: %s\n",
+				            astcenc_get_error_string(sub_status));
+				decompress_failed = true;
+				break;
+			}
+
+			texture_decomp_out->images.push_back(std::move(sub_out));
+		}
 
 		decompression_time = get_time() - start_decompression_time;
 
-
-		astcenc_error decode_status = work.error.load();
-		if (decode_status == ASTCENC_ERR_BAD_BLOCK)
+		if (decompress_failed)
 		{
-			print_error("WARNING: Invalid or unsupported blocks decoded as error colors\n");
-			is_decompression_warning = true;
-		}
-		else if (decode_status != ASTCENC_SUCCESS)
-		{
-			print_error("ERROR: Codec decompress failed: %s\n",
-			            astcenc_get_error_string(decode_status));
 			return 1;
 		}
 	}
 
-	// Print metrics in comparison mode
+	// Print metrics in comparison mode; compare the first sub-image for single-image textures
 	if (operation & ASTCENC_STAGE_COMPARE)
 	{
+		if (!is_single_image_texture(texture_uncomp_in.get()))
+		{
+			printf("NOTE: Quality metrics are reported for the base level only; "
+			       "all %zu sub-images were processed.\n\n",
+			       static_cast<size_t>(texture_uncomp_in->images.size()));
+		}
+
 		bool is_normal_map = config.flags & ASTCENC_FLG_MAP_NORMAL;
 
 		// Use the original image's exposure range for both metrics and preview files
@@ -3034,7 +3218,7 @@ int astcenc_main(
 		compute_error_metrics(
 		    image_uncomp_in_is_hdr, is_normal_map,
 		    image_uncomp_in_component_count,
-		    image_uncomp_in, image_decomp_out.get(),
+		    image_uncomp_in, texture_decomp_out->images.front().get(),
 		    cli_config.low_fstop, cli_config.high_fstop);
 	}
 
@@ -3043,7 +3227,14 @@ int astcenc_main(
 	{
 		if (ends_with(output_filename, ".astc"))
 		{
-			error = store_cimage(image_comp, output_filename.c_str());
+			// The .astc container holds one image only; reject resources it cannot represent
+			if (!is_single_image_compressed_texture(&texture_comp))
+			{
+				print_error("ERROR: Mipmapped, array, or cube map textures can only be stored as KTX\n");
+				return 1;
+			}
+
+			error = store_cimage(texture_comp.images.front(), output_filename.c_str());
 			if (error)
 			{
 				print_error("ERROR: Failed to store compressed image\n");
@@ -3052,8 +3243,7 @@ int astcenc_main(
 		}
 		else if (ends_with(output_filename, ".ktx"))
 		{
-			bool srgb = profile == ASTCENC_PRF_LDR_SRGB;
-			error = store_ktx_compressed_image(image_comp, output_filename.c_str(), srgb);
+			error = store_ktx_compressed_texture(texture_comp, output_filename.c_str());
 			if (error)
 			{
 				print_error("ERROR: Failed to store compressed image\n");
@@ -3078,12 +3268,13 @@ int astcenc_main(
 			bool is_store_error;
 			if (is_ldr_exposure_output)
 			{
-				is_store_error = store_ldr_exposures(*image_decomp_out, output_filename, cli_config);
+				is_store_error = store_ldr_exposures(
+				    *texture_decomp_out->images.front(), output_filename, cli_config);
 			}
 			else
 			{
-				is_store_error = store_ncimage(image_decomp_out.get(), output_filename.c_str(),
-				                              cli_config.y_flip);
+				is_store_error = store_nctexture(
+				    texture_decomp_out.get(), output_filename.c_str(), cli_config.y_flip);
 			}
 
 			if (is_store_error)
@@ -3096,9 +3287,10 @@ int astcenc_main(
 
 #if defined(ASTCENC_DIAGNOSTICS)
 	// Store diagnostic images
-	if (cli_config.diagnostic_images && !is_null)
+	if (cli_config.diagnostic_images && !is_null &&
+	    is_single_image_compressed_texture(&texture_comp))
 	{
-		print_diagnostic_images(codec_context.get(), image_comp, output_filename);
+		print_diagnostic_images(codec_context.get(), texture_comp.images.front(), output_filename);
 	}
 #endif
 
@@ -3130,7 +3322,7 @@ int astcenc_main(
 #if defined(ASTCENC_RDO_SIZE)
 	if ((operation & ASTCENC_STAGE_COMPARE) && (config.lz_rdo_lambda > 0.0f))
 	{
-		bool is_metrics_error = print_compression_metrics(image_comp);
+		bool is_metrics_error = print_compression_metrics(texture_comp.images.front());
 		if (is_metrics_error)
 		{
 			return 1;
