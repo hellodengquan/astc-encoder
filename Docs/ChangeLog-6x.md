@@ -116,6 +116,13 @@ header from the same release to avoid compatibility issues.
     side. An explicit `-mpsnr` range overrides automatic exposure selection.
   * **Feature:** Add crop region support for compression. Crop regions are
     extracted in the image coordinate space before flipping or preprocessing.
+  * **Feature:** Add GPU decode profile analysis. The new library function
+    `astcenc_get_decode_profile()` reports whether a compressed texture needs
+    the optional HDR decode profile, counts the blocks that fail on LDR-only
+    hardware and the region they occupy, and counts the blocks that are invalid
+    in every profile. The new `-p` command line mode exposes the same analysis.
+    It is available in decompress-only library builds and does not depend on a
+    codec context or color profile.
 * **Build system updates:**
   * **Bug fix:** Restore Clang compression performance by disabling unintended
     floating-point trapping, retaining precise arithmetic and the configured

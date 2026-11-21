@@ -188,6 +188,25 @@ prints out some image quality metrics to the console.
 The modes available mirror the options used for compression, but use a `t`
 prefix.
 
+## Checking GPU decode profile requirements
+
+All GPUs that support ASTC must implement the LDR decode profiles, but support
+for the HDR decode profile is optional. Use the `-p` mode to report what a
+compressed texture needs:
+
+    astcenc -p example.astc
+
+This analyzes the compressed data and reports whether the texture needs the HDR
+decode profile, how many blocks decode as an error color on an LDR-only device
+and the region they occupy, and how many blocks are invalid in every profile. It
+writes no output file, and accepts both `.astc` and `.ktx` inputs, for both 2D
+and 3D textures. The analysis is independent of the color profile used to
+compress the texture.
+
+The command exits with status 0 when the analysis completes, so it can be run
+as a pipeline step; the verdict is reported on the console, and `-silent`
+suppresses the report.
+
 ## Experimenting
 
 Efficient real-time graphics benefits from minimizing compressed texture size,

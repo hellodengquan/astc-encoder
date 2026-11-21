@@ -40,6 +40,7 @@ target_sources(${ASTCENC_TEST}
         test_simd.cpp
         test_softfloat.cpp
         test_decode.cpp
+        test_decode_profile.cpp
         test_encode.cpp
         test_image.cpp)
 

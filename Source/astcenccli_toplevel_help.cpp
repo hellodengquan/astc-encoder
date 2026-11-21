@@ -51,6 +51,12 @@ To perform a compression test, writing back the decompressed output, use:
 e.g. using LDR profile, 8x6 blocks, and the thorough quality preset:
     astcenc -tl kodim01.png kodim01-test.png 8x6 -thorough
 
+To report the GPU decode profile requirements of a compressed texture, use:
+    astcenc -p <in>
+
+e.g. checking whether a texture needs the optional HDR decode profile:
+    astcenc -p kodim01.astc
+
 The -*l options are used to configure the codec to support only the linear
 LDR profile, preventing use of the HDR encoding features.
 
@@ -81,6 +87,7 @@ SYNOPSIS
     astcenc {-cl|-cs|-ch|-cH} <in> <out> <blocksize> <quality> [options]
     astcenc {-dl|-ds|-dh|-dH} <in> <out>
     astcenc {-tl|-ts|-th|-tH} <in> <out> <blocksize> <quality> [options]
+    astcenc -p <in> [options]
 
 DESCRIPTION
 
@@ -558,6 +565,41 @@ DECOMPRESSION
     The -dsw option documented in ADVANCED COMPRESSION is also relevant to
     decompression.
 
+DECODE PROFILE ANALYSIS
+
+    To report the GPU decode profile requirements of a compressed texture
+    use:
+        astcenc -p <in> [-silent]
+
+    The input must be a compressed ASTC (*.astc) or Khronos Texture KTX
+    (*.ktx) file, and may be two-dimensional or three-dimensional. No output
+    file is written.
+
+    All GPUs that support ASTC must implement the LDR decode profiles, but
+    support for the HDR decode profile is optional. The analysis reports:
+
+    * whether the texture needs the HDR decode profile, or can be sampled
+      correctly on LDR-only hardware;
+    * the number of blocks that decode as an error color on LDR-only
+      hardware, and the bounding box of block indices they occupy;
+    * the number of blocks that are invalid in every decode profile.
+
+    A block needs HDR if it is a constant color block storing FP16 data, or
+    if any of its color endpoints uses an HDR endpoint encoding. A block is
+    invalid if its physical encoding is illegal in every profile. Both are
+    error colors on an LDR-only device, so both are counted in the LDR error
+    block count; the invalid blocks are also counted separately.
+
+    The analysis is a property of the compressed data alone and does not
+    depend on the color profile used for compression or decompression. It
+    always considers every block mode and partitioning defined by the ASTC
+    format, so it is not affected by compressor configuration. The color
+    profile options (-d*, -t*) are not used with -p.
+
+    With -silent no report is printed. Use the report fields, not the exit
+    status, to decide the texture format; -p exits with status 0 whenever the
+    analysis completes, regardless of its verdict.
+
 TEST
 
     To perform a compression test of an image using astcenc you must
@@ -648,6 +690,9 @@ QUICK REFERENCE
 
     To perform a quality test use:
         astcenc {-tl|-ts|-th|-tH} <in> <out> <blocksize> <quality> [options]
+
+    To report the GPU decode profile requirements of a compressed texture use:
+        astcenc -p <in>
 
     Mode -*l = linear LDR, -*s = sRGB LDR, -*h = HDR RGB/LDR A, -*H = HDR.
     Quality = -fastest/-fast/-medium/-thorough/-verythorough/-exhaustive

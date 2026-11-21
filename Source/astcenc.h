@@ -784,6 +784,98 @@ struct astcenc_block_info
 };
 
 /**
+ * @brief The result of a compressed image GPU decode profile analysis.
+ *
+ * The analysis is a property of the compressed data alone. It is unaffected by the color profile
+ * of any codec context, and always considers the complete set of legal block modes and
+ * partitionings, so a block cannot be misclassified because a self-decompress context omitted the
+ * encoding it uses.
+ *
+ * Block classification is based on the same rules the decoder applies:
+ *
+ *   * A block is @e invalid if the physical encoding is not legal in any profile. This includes
+ *     reserved block modes, impossible weight grids, out-of-spec partitionings, and constant
+ *     color blocks with an invalid void-extent.
+ *   * A block @e requires @e HDR if it is a constant color block storing FP16 data, or if any of
+ *     its color endpoints uses an HDR endpoint encoding. Such a block is decoded as an error color
+ *     by an LDR-only decoder.
+ *   * All other blocks decode correctly in every profile.
+ */
+struct astcenc_decode_profile_result
+{
+	/** @brief True if no block in the image fails to decode on an LDR-only device. */
+	bool is_ldr_compatible;
+
+	/** @brief True if at least one block requires the HDR decode profile. */
+	bool requires_hdr;
+
+	/** @brief The number of blocks that require the HDR decode profile. */
+	size_t hdr_block_count;
+
+	/** @brief The number of blocks that are invalid in every supported profile. */
+	size_t invalid_block_count;
+
+	/**
+	 * @brief The number of blocks that decode as an error color on an LDR-only device.
+	 *
+	 * This is the union of the HDR-requiring blocks and the blocks that are invalid in every
+	 * profile; it is always equal to @c hdr_block_count plus @c invalid_block_count.
+	 */
+	size_t ldr_error_block_count;
+
+	/** @brief The total number of blocks analyzed. */
+	size_t block_count;
+
+	/** @brief The number of texels in the block X dimension. */
+	unsigned int block_x;
+
+	/** @brief The number of texels in the block Y dimension. */
+	unsigned int block_y;
+
+	/** @brief The number of texels in the block Z dimension. */
+	unsigned int block_z;
+
+	/** @brief The image X dimension, in texels. */
+	size_t dim_x;
+
+	/** @brief The image Y dimension, in texels. */
+	size_t dim_y;
+
+	/** @brief The image Z dimension, in texels. */
+	size_t dim_z;
+
+	/** @brief The number of blocks in the X dimension. */
+	size_t blocks_x;
+
+	/** @brief The number of blocks in the Y dimension. */
+	size_t blocks_y;
+
+	/** @brief The number of blocks in the Z dimension. */
+	size_t blocks_z;
+
+	/** @brief True if at least one block in @c ldr_error_block_count exists. */
+	bool has_ldr_error_region;
+
+	/**
+	 * @brief The inclusive lower bound of the blocks that fail on an LDR-only device, in block
+	 *        indices as [x, y, z].
+	 *
+	 * Only valid if @c has_ldr_error_region is true. The bounds are the tight bounding box
+	 * covering every HDR-requiring block and every block invalid in all profiles, because both
+	 * decode as an error color on LDR-only hardware.
+	 */
+	size_t ldr_error_region_min[3];
+
+	/**
+	 * @brief The inclusive upper bound of the blocks that fail on an LDR-only device, in block
+	 *        indices as [x, y, z].
+	 *
+	 * Only valid if @c has_ldr_error_region is true.
+	 */
+	size_t ldr_error_region_max[3];
+};
+
+/**
  * Populate a codec config based on default settings.
  *
  * Power users can edit the returned config struct to fine tune before allocating the context.
@@ -969,6 +1061,59 @@ ASTCENC_PUBLIC enum astcenc_error astcenc_get_block_info(
 	struct astcenc_context* context,
 	const uint8_t data[16],
 	struct astcenc_block_info* info);
+
+/**
+ * @brief Report the GPU decode profile requirements of a compressed image.
+ *
+ * This answers the question a texture packing tool needs to answer: can this texture be sampled
+ * correctly on a device that only implements the LDR ASTC decode profiles, or does it require the
+ * optional HDR profile? It also counts the blocks that fail on LDR-only hardware, reports the
+ * region they occupy, and counts the blocks that are invalid in every profile.
+ *
+ * All GPUs that support ASTC must implement the LDR decode profiles, but support for the HDR
+ * decode profile is optional. A block requires HDR if it is a constant color block storing FP16
+ * data, or if any of its color endpoints uses an HDR endpoint encoding. A block is invalid if its
+ * physical encoding is not legal in any profile. Both classes decode as an error color on an
+ * LDR-only device.
+ *
+ * The result is a property of the compressed data alone. It does not depend on any codec context
+ * and does not need one; this function is available in decompress-only library builds. The
+ * analysis always considers every block mode and partitioning defined by the ASTC format for the
+ * given block size, not just those enabled by a particular compressor configuration, so a block
+ * cannot be misclassified because a self-decompress context omitted the encoding it uses.
+ *
+ * The caller supplies the block dimensions and image dimensions, as stored in the container
+ * header (for example the .astc or KTX header), and the compressed payload. The function validates
+ * that the payload is large enough for those dimensions before reading it. For a container with
+ * multiple mip levels, pass the base level dimensions; only that level is analyzed.
+ *
+ * This function does not modify the behavior of @c astcenc_get_block_info() or
+ * @c astcenc_decompress_image().
+ *
+ * @param      data      Pointer to the compressed data.
+ * @param      data_len  Length of the compressed data, in bytes.
+ * @param      block_x   The block size X dimension, in texels.
+ * @param      block_y   The block size Y dimension, in texels.
+ * @param      block_z   The block size Z dimension, in texels; zero means two-dimensional.
+ * @param      dim_x     The image X dimension, in texels.
+ * @param      dim_y     The image Y dimension, in texels.
+ * @param      dim_z     The image Z dimension, in texels; one for a 2D image.
+ * @param[out] result    The analysis result to populate.
+ *
+ * @return @c ASTCENC_SUCCESS on success, @c ASTCENC_ERR_BAD_PARAM if the block size or image
+ *         dimensions are invalid, or @c ASTCENC_ERR_OUT_OF_MEM if the data is too short for the
+ *         stated image dimensions or the analysis working memory cannot be allocated.
+ */
+ASTCENC_PUBLIC enum astcenc_error astcenc_get_decode_profile(
+	const uint8_t* data,
+	size_t data_len,
+	unsigned int block_x,
+	unsigned int block_y,
+	unsigned int block_z,
+	size_t dim_x,
+	size_t dim_y,
+	size_t dim_z,
+	struct astcenc_decode_profile_result* result);
 
 /**
  * @brief Get a printable string for a specific status code.

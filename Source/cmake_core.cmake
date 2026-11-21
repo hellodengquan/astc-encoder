@@ -29,6 +29,7 @@ add_library(${ASTCENC_TARGET}-static
         astcenc_color_unquantize.cpp
         astcenc_compress_symbolic.cpp
         astcenc_compute_variance.cpp
+        astcenc_decode_profile.cpp
         astcenc_decompress_symbolic.cpp
         astcenc_diagnostic_trace.cpp
         astcenc_entry.cpp
@@ -61,6 +62,7 @@ if(${ASTCENC_SHAREDLIB})
             astcenc_color_unquantize.cpp
             astcenc_compress_symbolic.cpp
             astcenc_compute_variance.cpp
+            astcenc_decode_profile.cpp
             astcenc_decompress_symbolic.cpp
             astcenc_diagnostic_trace.cpp
             astcenc_entry.cpp

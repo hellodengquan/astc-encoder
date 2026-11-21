@@ -110,6 +110,10 @@ static const astcenc_operation ASTCENC_OP_TEST =
                                ASTCENC_STAGE_COMPARE |
                                ASTCENC_STAGE_ST_NCOMP;
 
+/** @brief Operation indicating the user wants to analyze the decode profile requirements. */
+static const astcenc_operation ASTCENC_OP_PROFILE =
+                               ASTCENC_STAGE_LD_COMP;
+
 /**
  * @brief Image preprocessing tasks prior to encoding.
  */
@@ -137,6 +141,7 @@ static const mode_entry modes[] {
 	{"-cH",      ASTCENC_OP_COMPRESS,   ASTCENC_PRF_HDR},
 	{"-dH",      ASTCENC_OP_DECOMPRESS, ASTCENC_PRF_HDR},
 	{"-tH",      ASTCENC_OP_TEST,       ASTCENC_PRF_HDR},
+	{"-p",       ASTCENC_OP_PROFILE,    ASTCENC_PRF_HDR},
 	{"-h",       ASTCENC_OP_HELP,       ASTCENC_PRF_HDR},
 	{"-help",    ASTCENC_OP_HELP,       ASTCENC_PRF_HDR},
 	{"-v",       ASTCENC_OP_VERSION,    ASTCENC_PRF_HDR},
@@ -2527,6 +2532,96 @@ static void print_diagnostic_images(
 #endif
 
 /**
+ * @brief Print the GPU decode profile analysis of a compressed image.
+ *
+ * @param analysis    The analysis result.
+ * @param input_name  The input file name, for reporting.
+ * @param silentmode  @c true to suppress the detailed report.
+ */
+static void print_decode_profile(
+	const astcenc_decode_profile_result& analysis,
+	const std::string& input_name,
+	bool silentmode
+) {
+	if (silentmode)
+	{
+		return;
+	}
+
+	printf("Decode profile analysis\n");
+	printf("=======================\n\n");
+	printf("    Input:                      %s\n", input_name.c_str());
+
+	if (analysis.block_z > 1)
+	{
+		printf("    Dimensions:                 3D, %zux%zux%zu\n",
+		       analysis.dim_x, analysis.dim_y, analysis.dim_z);
+	}
+	else
+	{
+		printf("    Dimensions:                 2D, %zux%zu\n",
+		       analysis.dim_x, analysis.dim_y);
+	}
+
+	printf("    Block size:                 %ux%ux%u\n",
+	       analysis.block_x, analysis.block_y, analysis.block_z);
+	printf("    Block count:                %zu\n", analysis.block_count);
+	printf("\n");
+
+	// Report the strongest requirement first; invalid blocks cannot be sampled by any profile
+	if (analysis.invalid_block_count > 0)
+	{
+		printf("    GPU decode profile:         invalid blocks present\n");
+	}
+	else if (analysis.requires_hdr)
+	{
+		printf("    GPU decode profile:         HDR required\n");
+	}
+	else
+	{
+		printf("    GPU decode profile:         LDR only\n");
+	}
+
+	printf("    LDR compatible:             %s\n", analysis.is_ldr_compatible ? "yes" : "no");
+	printf("    HDR-requiring blocks:       %zu\n", analysis.hdr_block_count);
+	printf("    Invalid blocks:             %zu\n", analysis.invalid_block_count);
+	printf("    LDR error blocks:           %zu\n", analysis.ldr_error_block_count);
+
+	if (analysis.has_ldr_error_region)
+	{
+		printf("    LDR error region (blocks):  [%zu, %zu, %zu] to [%zu, %zu, %zu]\n",
+		       analysis.ldr_error_region_min[0], analysis.ldr_error_region_min[1],
+		       analysis.ldr_error_region_min[2], analysis.ldr_error_region_max[0],
+		       analysis.ldr_error_region_max[1], analysis.ldr_error_region_max[2]);
+
+		// Report the same region in texels, clipped to the image, for human consumption
+		size_t texel_min[3];
+		size_t texel_max[3];
+		for (size_t axis = 0; axis < 3; axis++)
+		{
+			texel_min[axis] = analysis.ldr_error_region_min[axis] * (axis == 0 ? analysis.block_x :
+			                 axis == 1 ? analysis.block_y : analysis.block_z);
+			texel_max[axis] = (analysis.ldr_error_region_max[axis] + 1) *
+			                  (axis == 0 ? analysis.block_x :
+			                   axis == 1 ? analysis.block_y : analysis.block_z) - 1;
+
+			size_t dim = axis == 0 ? analysis.dim_x : axis == 1 ? analysis.dim_y : analysis.dim_z;
+			texel_max[axis] = astc::min(texel_max[axis], dim - 1);
+		}
+
+		printf("    LDR error region (texels):  [%zu, %zu, %zu] to [%zu, %zu, %zu]\n",
+		       texel_min[0], texel_min[1], texel_min[2],
+		       texel_max[0], texel_max[1], texel_max[2]);
+	}
+	else
+	{
+		printf("    LDR error region (blocks):  none\n");
+	}
+
+	printf("\n");
+}
+
+/**
  * @brief The main entry point.
  *
  * @param argc   The number of arguments.
@@ -2577,7 +2672,9 @@ int astcenc_main(
 		return 1;
 	}
 
-	if (output_filename.empty())
+	// The decode profile analysis reads only a compressed input and writes no output image
+	bool is_profile_op = operation == ASTCENC_OP_PROFILE;
+	if (!is_profile_op && output_filename.empty())
 	{
 		print_error("ERROR: Output file not specified\n");
 		return 1;
@@ -2606,14 +2703,19 @@ int astcenc_main(
 				return 1;
 			}
 
-			if (is_srgb && (profile != ASTCENC_PRF_LDR_SRGB))
+			// The profile analysis works on the compressed data, so the declared color space is
+			// irrelevant; only warn for operations that decode it.
+			if (!is_profile_op)
 			{
-				printf("WARNING: Input file is sRGB, but decompressing as linear\n");
-			}
+				if (is_srgb && (profile != ASTCENC_PRF_LDR_SRGB))
+				{
+					printf("WARNING: Input file is sRGB, but decompressing as linear\n");
+				}
 
-			if (!is_srgb && (profile == ASTCENC_PRF_LDR_SRGB))
-			{
-				printf("WARNING: Input file is linear, but decompressing as sRGB\n");
+				if (!is_srgb && (profile == ASTCENC_PRF_LDR_SRGB))
+				{
+					printf("WARNING: Input file is linear, but decompressing as sRGB\n");
+				}
 			}
 		}
 		else
@@ -2621,6 +2723,44 @@ int astcenc_main(
 			print_error("ERROR: Unknown compressed input file type\n");
 			return 1;
 		}
+	}
+
+	// The profile check is a standalone analysis of the compressed data; it needs no codec
+	// context and no output file.
+	if (is_profile_op)
+	{
+		bool silentmode = false;
+		for (int i = 3; i < argc; i++)
+		{
+			if (!strcmp(argv[i], "-silent"))
+			{
+				silentmode = true;
+			}
+			else
+			{
+				print_error("ERROR: Unrecognized option '%s' for -p\n", argv[i]);
+				return 1;
+			}
+		}
+
+		astcenc_decode_profile_result analysis;
+		astcenc_error status = astcenc_get_decode_profile(
+		    image_comp.data.data(), image_comp.data.size(),
+		    image_comp.block_x, image_comp.block_y, image_comp.block_z,
+		    image_comp.dim_x, image_comp.dim_y, image_comp.dim_z,
+		    &analysis);
+		if (status != ASTCENC_SUCCESS)
+		{
+			print_error("ERROR: Decode profile analysis failed: %s\n",
+			            astcenc_get_error_string(status));
+			return 1;
+		}
+
+		print_decode_profile(analysis, input_filename, silentmode);
+
+		// A successful analysis exits with zero whether or not the texture is LDR compatible; the
+		// verdict is in the report, so it is not confused with a decode failure.
+		return 0;
 	}
 
 	astcenc_config config {};
